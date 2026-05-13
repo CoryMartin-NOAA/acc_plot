@@ -9,6 +9,7 @@ import re
 
 nc = None
 np = None
+SKILL_THRESHOLD = 0.6
 
 
 def parse_args() -> argparse.Namespace:
@@ -204,7 +205,13 @@ def main() -> None:
     plt.plot(leads, control_acc, marker="o", linestyle="-", label="Control Run")
     plt.plot(leads, experiment_acc, marker="s", linestyle="--", label="Experiment")
     plt.axhline(0.0, color="k", linewidth=0.8)
-    plt.axhline(0.6, color="gray", linestyle=":", linewidth=1.0, label="Skill Threshold (0.6)")
+    plt.axhline(
+        SKILL_THRESHOLD,
+        color="gray",
+        linestyle=":",
+        linewidth=1.0,
+        label=f"Skill Threshold ({SKILL_THRESHOLD:.1f})",
+    )
     plt.ylim(-0.2, 1.0)
     plt.xlim(0, args.max_lead)
     plt.xlabel("Lead time (hours)")
