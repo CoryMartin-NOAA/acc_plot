@@ -5,6 +5,7 @@ import argparse
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 
 nc = None
 np = None
@@ -46,7 +47,7 @@ def _find_hgt_name(ds) -> str:
     if "HGT_500mb" in ds.variables:
         return "HGT_500mb"
     for name in ds.variables:
-        if "HGT" in name and "500" in name:
+        if re.search(r"^HGT.*(?:_500mb|_500MB|500hPa)\b", name):
             return name
     raise KeyError("Could not find a 500 hPa geopotential height variable.")
 
@@ -71,6 +72,7 @@ def _open_nc_file(path: Path) -> dict:
             tzinfo=timezone.utc,
         )
 
+        # WGRIB2 NetCDF output commonly includes this custom epoch-seconds attribute.
         ref_epoch = getattr(time_var, "reference_time", None)
         ref_dt = None
         if ref_epoch is not None:
@@ -120,6 +122,14 @@ def _list_nc_files(directory: Path) -> list[Path]:
     return sorted(p for p in directory.iterdir() if p.is_file() and p.suffix == ".nc")
 
 
+def _same_grid(a: dict, b: dict) -> bool:
+    return np.allclose(a["lat"], b["lat"], atol=1e-6, rtol=0.0) and np.allclose(a["lon"], b["lon"], atol=1e-6, rtol=0.0)
+
+
+def _mean_by_leads(acc_by_lead: dict, leads: list[int]) -> list[float]:
+    return [float(np.nanmean(acc_by_lead[lead])) if lead in acc_by_lead else np.nan for lead in leads]
+
+
 def main() -> None:
     args = parse_args()
 
@@ -157,14 +167,14 @@ def main() -> None:
             return
 
         analysis = analysis_by_valid[fcst["valid_dt"]]
-        if not np.array_equal(fcst["lat"], analysis["lat"]) or not np.array_equal(fcst["lon"], analysis["lon"]):
+        if not _same_grid(fcst, analysis):
             raise ValueError(f"Grid mismatch between forecast and analysis for {path}")
 
         mmdd = fcst["valid_dt"].strftime("%m%d")
         if mmdd not in cached_climo:
             cached_climo[mmdd] = _load_climo(args.climo_dir, mmdd)
         climo = cached_climo[mmdd]
-        if not np.array_equal(fcst["lat"], climo["lat"]) or not np.array_equal(fcst["lon"], climo["lon"]):
+        if not _same_grid(fcst, climo):
             raise ValueError(f"Grid mismatch between forecast and climatology for {path}")
 
         fcst_anom = fcst["hgt"] - climo["hgt"]
@@ -180,10 +190,8 @@ def main() -> None:
     if not leads:
         raise ValueError("No matched valid times were found to compute ACC.")
 
-    control_acc = [float(np.nanmean(control_acc_by_lead[lead])) if lead in control_acc_by_lead else np.nan for lead in leads]
-    experiment_acc = [
-        float(np.nanmean(experiment_acc_by_lead[lead])) if lead in experiment_acc_by_lead else np.nan for lead in leads
-    ]
+    control_acc = _mean_by_leads(control_acc_by_lead, leads)
+    experiment_acc = _mean_by_leads(experiment_acc_by_lead, leads)
 
     plt.figure(figsize=(9, 5))
     plt.plot(leads, control_acc, marker="o", label="Control")

@@ -41,10 +41,9 @@ if [[ $# -gt 0 ]]; then
     build_one_day "${mmdd}"
   done
 else
-  for in_file in "${CLIMO_SRC_DIR}"/mean_[0-1][0-9][0-3][0-9]; do
-    [[ -e "${in_file}" ]] || continue
-    mmdd="${in_file##*_}"
-    build_one_day "${mmdd}"
+  for month in $(seq -w 1 12); do
+    for day in $(seq -w 1 31); do
+      build_one_day "${month}${day}"
+    done
   done
 fi
-
