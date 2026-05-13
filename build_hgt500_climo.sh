@@ -42,7 +42,13 @@ if [[ $# -gt 0 ]]; then
   done
 else
   for month in $(seq -w 1 12); do
-    for day in $(seq -w 1 31); do
+    case "${month}" in
+      01|03|05|07|08|10|12) max_day=31 ;;
+      04|06|09|11) max_day=30 ;;
+      02) max_day=29 ;;
+      *) continue ;;
+    esac
+    for day in $(seq -w 1 "${max_day}"); do
       build_one_day "${month}${day}"
     done
   done

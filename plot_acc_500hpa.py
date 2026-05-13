@@ -167,14 +167,16 @@ def main() -> None:
             return
 
         analysis = analysis_by_valid[fcst["valid_dt"]]
-        if not _same_grid(fcst, analysis):
+        grids_match_analysis = _same_grid(fcst, analysis)
+        if not grids_match_analysis:
             raise ValueError(f"Grid mismatch between forecast and analysis for {path}")
 
         mmdd = fcst["valid_dt"].strftime("%m%d")
         if mmdd not in cached_climo:
             cached_climo[mmdd] = _load_climo(args.climo_dir, mmdd)
         climo = cached_climo[mmdd]
-        if not _same_grid(fcst, climo):
+        grids_match_climo = _same_grid(fcst, climo)
+        if not grids_match_climo:
             raise ValueError(f"Grid mismatch between forecast and climatology for {path}")
 
         fcst_anom = fcst["hgt"] - climo["hgt"]
