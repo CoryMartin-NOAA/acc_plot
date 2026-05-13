@@ -9,6 +9,7 @@ import re
 
 nc = None
 np = None
+# Standard threshold for "useful" anomaly correlation skill.
 SKILL_THRESHOLD = 0.6
 
 
