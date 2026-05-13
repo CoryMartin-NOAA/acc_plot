@@ -201,9 +201,10 @@ def main() -> None:
     experiment_acc = _mean_by_leads(experiment_acc_by_lead, leads)
 
     plt.figure(figsize=(9, 5))
-    plt.plot(leads, control_acc, marker="o", label="Control")
-    plt.plot(leads, experiment_acc, marker="o", label="Experiment")
+    plt.plot(leads, control_acc, marker="o", linestyle="-", label="Control Run")
+    plt.plot(leads, experiment_acc, marker="s", linestyle="--", label="Experiment")
     plt.axhline(0.0, color="k", linewidth=0.8)
+    plt.axhline(0.6, color="gray", linestyle=":", linewidth=1.0, label="Skill Threshold (0.6)")
     plt.ylim(-0.2, 1.0)
     plt.xlim(0, args.max_lead)
     plt.xlabel("Lead time (hours)")
