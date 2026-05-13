@@ -5,7 +5,7 @@ quick computation and plot of 500 hPa GPH ACC scores
 
 ### 1) Build daily 500 hPa climatology files on WCOSS2
 
-`/home/runner/work/acc_plot/acc_plot/build_hgt500_climo.sh`
+`./build_hgt500_climo.sh`
 
 This script reads ERA5 climatology GRIB files named `mean_MMDD` from:
 
@@ -18,12 +18,12 @@ height), writes GRIB output `hgt500_climo_MMDD.grb`, then converts to NetCDF
 Example:
 
 ```bash
-bash /home/runner/work/acc_plot/acc_plot/build_hgt500_climo.sh 0101 0102
+bash ./build_hgt500_climo.sh 0101 0102
 ```
 
 ### 2) Compute and plot 500 hPa ACC (analysis vs control/experiment)
 
-`/home/runner/work/acc_plot/acc_plot/plot_acc_500hpa.py`
+`./plot_acc_500hpa.py`
 
 Inputs are directories containing single-valid-time NetCDF files (analysis,
 control, experiment) with `HGT_500mb(time, latitude, longitude)`.
@@ -31,7 +31,7 @@ control, experiment) with `HGT_500mb(time, latitude, longitude)`.
 Example:
 
 ```bash
-python /home/runner/work/acc_plot/acc_plot/plot_acc_500hpa.py \
+python ./plot_acc_500hpa.py \
   --analysis-dir /path/to/analysis_nc \
   --control-dir /path/to/control_nc \
   --experiment-dir /path/to/experiment_nc \
