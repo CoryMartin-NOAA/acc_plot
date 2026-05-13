@@ -41,3 +41,17 @@ python ./plot_acc_500hpa.py \
   --climo-dir /lfs/h2/emc/ptmp/${USER} \
   --output-plot /path/to/acc_500hpa.png
 ```
+
+### 3) Convert experiment GRIB2 files to NetCDF
+
+`./convert_grib2_to_netcdf.sh`
+
+Converts one or more GRIB2 files using:
+
+`wgrib2 input_file.grib2 -netcdf output_file.nc`
+
+Example:
+
+```bash
+OUT_DIR=/lfs/h2/emc/ptmp/${USER} bash ./convert_grib2_to_netcdf.sh /path/to/experiment/*.grib2
+```
