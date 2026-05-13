@@ -15,6 +15,9 @@ For each date, it extracts `kpds5=7, kpds6=100, kpds7=500` (500 hPa geopotential
 height), writes GRIB output `hgt500_climo_MMDD.grb`, then converts to NetCDF
 `hgt500_climo_MMDD.grb.nc`.
 
+Note: the extractor uses `wgrib` KPDS matching and expects GRIB1-style
+`mean_MMDD` input files.
+
 Example:
 
 ```bash

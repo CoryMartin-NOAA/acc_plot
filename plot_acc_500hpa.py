@@ -91,6 +91,9 @@ def _open_nc_file(path: Path) -> dict:
 
 def _acc_weighted(forecast_anom: np.ndarray, analysis_anom: np.ndarray, lat: np.ndarray) -> float:
     _ensure_dependencies()
+    if lat.ndim != 1:
+        raise ValueError("Latitude coordinate must be 1D for cosine-latitude ACC weighting.")
+
     weights = np.cos(np.deg2rad(lat))[:, None]
     valid = np.isfinite(forecast_anom) & np.isfinite(analysis_anom)
     if not np.any(valid):
@@ -102,7 +105,7 @@ def _acc_weighted(forecast_anom: np.ndarray, analysis_anom: np.ndarray, lat: np.
 
     numer = np.sum(w * f * a)
     denom = np.sqrt(np.sum(w * f * f) * np.sum(w * a * a))
-    if denom == 0.0:
+    if np.isclose(denom, 0.0):
         return np.nan
     return float(numer / denom)
 
@@ -123,7 +126,9 @@ def _list_nc_files(directory: Path) -> list[Path]:
 
 
 def _same_grid(a: dict, b: dict) -> bool:
-    return np.allclose(a["lat"], b["lat"], atol=1e-6, rtol=0.0) and np.allclose(a["lon"], b["lon"], atol=1e-6, rtol=0.0)
+    return np.allclose(a["lat"], b["lat"], atol=1e-6, rtol=1e-9) and np.allclose(
+        a["lon"], b["lon"], atol=1e-6, rtol=1e-9
+    )
 
 
 def _mean_by_leads(acc_by_lead: dict, leads: list[int]) -> list[float]:

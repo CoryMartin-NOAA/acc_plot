@@ -28,9 +28,17 @@ build_one_day() {
   fi
 
   echo "Processing ${in_file}"
-  wgrib "${in_file}" \
+  if ! wgrib "${in_file}" >/dev/null 2>&1; then
+    echo "WARNING: ${in_file} is not readable by wgrib (script expects GRIB1 mean_MMDD files); skipping." >&2
+    return 0
+  fi
+
+  if ! wgrib "${in_file}" \
     | grep ":kpds5=7:kpds6=100:kpds7=500:" \
-    | wgrib -i "${in_file}" -grib -o "${out_grib}"
+    | wgrib -i "${in_file}" -grib -o "${out_grib}"; then
+    echo "WARNING: could not extract 500 hPa field from ${in_file}; skipping." >&2
+    return 0
+  fi
 
   cdo -f nc4 copy "${out_grib}" "${out_nc}"
   echo "Wrote ${out_grib} and ${out_nc}"
