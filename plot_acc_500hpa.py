@@ -9,7 +9,7 @@ import re
 
 nc = None
 np = None
-# Standard threshold for "useful" anomaly correlation skill.
+# Standard meteorological convention for "useful" ACC forecast skill.
 SKILL_THRESHOLD = 0.6
 
 
