@@ -9,6 +9,8 @@ import re
 
 nc = None
 np = None
+# Standard meteorological convention for "useful" ACC forecast skill.
+SKILL_THRESHOLD = 0.6
 
 
 def parse_args() -> argparse.Namespace:
@@ -201,9 +203,16 @@ def main() -> None:
     experiment_acc = _mean_by_leads(experiment_acc_by_lead, leads)
 
     plt.figure(figsize=(9, 5))
-    plt.plot(leads, control_acc, marker="o", label="Control")
-    plt.plot(leads, experiment_acc, marker="o", label="Experiment")
+    plt.plot(leads, control_acc, marker="o", linestyle="-", label="Control Run")
+    plt.plot(leads, experiment_acc, marker="s", linestyle="--", label="Experiment")
     plt.axhline(0.0, color="k", linewidth=0.8)
+    plt.axhline(
+        SKILL_THRESHOLD,
+        color="gray",
+        linestyle=":",
+        linewidth=1.0,
+        label=f"Skill Threshold ({SKILL_THRESHOLD:.1f})",
+    )
     plt.ylim(-0.2, 1.0)
     plt.xlim(0, args.max_lead)
     plt.xlabel("Lead time (hours)")
