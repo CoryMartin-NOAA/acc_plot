@@ -53,6 +53,7 @@ else
     case "${month}" in
       01|03|05|07|08|10|12) max_day=31 ;;
       04|06|09|11) max_day=30 ;;
+      # Include leap-day climatology (0229) when available.
       02) max_day=29 ;;
       *) continue ;;
     esac

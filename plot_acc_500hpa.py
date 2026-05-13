@@ -47,7 +47,7 @@ def _find_hgt_name(ds) -> str:
     if "HGT_500mb" in ds.variables:
         return "HGT_500mb"
     for name in ds.variables:
-        if re.search(r"^HGT.*(?:_500mb|_500MB|500hPa)\b", name):
+        if re.search(r"^HGT.*(?:_500mb|_500MB|500hPa)", name):
             return name
     raise KeyError("Could not find a 500 hPa geopotential height variable.")
 
