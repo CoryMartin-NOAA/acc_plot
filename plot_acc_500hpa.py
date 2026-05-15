@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 
@@ -46,12 +46,60 @@ def _ensure_dependencies() -> None:
 
 
 def _find_hgt_name(ds) -> str:
+    if "var7" in ds.variables:
+        return "var7"
     if "HGT_500mb" in ds.variables:
         return "HGT_500mb"
     for name in ds.variables:
         if re.search(r"^HGT.*(?:_500mb|_500MB|500hPa)", name):
             return name
     raise KeyError("Could not find a 500 hPa geopotential height variable.")
+
+
+def _parse_valid_dt(time_var) -> datetime:
+    valid_num = float(time_var[0])
+    units = getattr(time_var, "units", "")
+    units_norm = units.strip().lower()
+
+    if re.match(r"seconds since 1970-01-01", units_norm):
+        return datetime.fromtimestamp(valid_num, tz=timezone.utc)
+
+    # CDO output for GRIB->NetCDF often uses numeric YYYYMMDD.fractional_day.
+    if re.fullmatch(r"day as %y%m%d\.%f", units.strip(), flags=re.IGNORECASE):
+        frac_day, ymd_int = np.modf(valid_num)
+        ymd = int(ymd_int)
+        ymd_str = f"{ymd:08d}"
+        base = datetime.strptime(ymd_str, "%Y%m%d").replace(tzinfo=timezone.utc)
+        return base + timedelta(days=float(frac_day))
+
+    valid_dt_raw = nc.num2date(valid_num, units=units)
+    return datetime(
+        valid_dt_raw.year,
+        valid_dt_raw.month,
+        valid_dt_raw.day,
+        valid_dt_raw.hour,
+        valid_dt_raw.minute,
+        int(valid_dt_raw.second),
+        tzinfo=timezone.utc,
+    )
+
+
+def _infer_ref_dt_from_filename(path: Path, valid_dt: datetime) -> datetime | None:
+    name = path.name
+
+    init_dt = None
+    init_match = re.search(r"(19|20)\d{8}", name)
+    if init_match:
+        init_dt = datetime.strptime(init_match.group(0), "%Y%m%d%H").replace(tzinfo=timezone.utc)
+
+    lead_match = re.search(r"(?:pgbf|f)(\d{2,3})", name, re.IGNORECASE)
+    if lead_match:
+        lead_hours = int(lead_match.group(1))
+        if init_dt is not None:
+            return init_dt
+        return valid_dt - timedelta(hours=lead_hours)
+
+    return init_dt
 
 
 def _open_nc_file(path: Path) -> dict:
@@ -62,30 +110,28 @@ def _open_nc_file(path: Path) -> dict:
         time_var = ds.variables["time"]
         hgt_name = _find_hgt_name(ds)
 
-        valid_num = float(time_var[0])
-        units = time_var.units
-        if re.match(r"seconds since 1970-01-01", units):
-            valid_dt = datetime.fromtimestamp(valid_num, tz=timezone.utc)
-        else:
-            valid_dt_raw = nc.num2date(valid_num, units=units)
-            valid_dt = datetime(
-                valid_dt_raw.year,
-                valid_dt_raw.month,
-                valid_dt_raw.day,
-                valid_dt_raw.hour,
-                valid_dt_raw.minute,
-                int(valid_dt_raw.second),
-                tzinfo=timezone.utc,
-            )
+        valid_dt = _parse_valid_dt(time_var)
 
         # WGRIB2 NetCDF output commonly includes this custom epoch-seconds attribute.
         ref_epoch = getattr(time_var, "reference_time", None)
         ref_dt = None
         if ref_epoch is not None:
             ref_dt = datetime.fromtimestamp(float(ref_epoch), tz=timezone.utc)
+        else:
+            # Fallback for CDO-style outputs that do not carry a reference_time attribute.
+            ref_dt = _infer_ref_dt_from_filename(path, valid_dt)
 
-        hgt = np.array(ds.variables[hgt_name][0, :, :], dtype=np.float64)
-        fill_value = getattr(ds.variables[hgt_name], "_FillValue", None)
+        hgt_var = ds.variables[hgt_name]
+        if hgt_var.ndim == 4:
+            hgt = np.array(hgt_var[0, 0, :, :], dtype=np.float64)
+        elif hgt_var.ndim == 3:
+            hgt = np.array(hgt_var[0, :, :], dtype=np.float64)
+        elif hgt_var.ndim == 2:
+            hgt = np.array(hgt_var[:, :], dtype=np.float64)
+        else:
+            raise ValueError(f"Unexpected rank {hgt_var.ndim} for HGT variable in {path}")
+
+        fill_value = getattr(hgt_var, "_FillValue", None)
         if fill_value is not None:
             hgt = np.where(np.isclose(hgt, float(fill_value)), np.nan, hgt)
 

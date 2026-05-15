@@ -22,6 +22,11 @@ build_one_day() {
   local out_grib="${OUT_DIR}/hgt500_climo_${mmdd}.grb"
   local out_nc="${out_grib}.nc"
 
+  if [[ -s "${out_nc}" ]]; then
+    echo "SKIP: ${out_nc} already exists; ${in_file} already processed."
+    return 0
+  fi
+
   if [[ ! -f "${in_file}" ]]; then
     echo "WARNING: missing input file ${in_file}; skipping." >&2
     return 0

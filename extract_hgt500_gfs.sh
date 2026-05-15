@@ -70,8 +70,8 @@ process_one() {
   local out_grib="${dest_dir}/${base}.hgt500.grb"
   local out_nc="${dest_dir}/${base}.hgt500.nc"
 
-  if [[ -f "${out_nc}" ]]; then
-    echo "SKIP: ${out_nc} already exists."
+  if [[ -s "${out_nc}" ]]; then
+    echo "SKIP: ${out_nc} already exists; ${in_file} already processed."
     return 0
   fi
 

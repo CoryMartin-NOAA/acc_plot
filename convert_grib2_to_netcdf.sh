@@ -38,6 +38,11 @@ for in_file in "$@"; do
   stem="${base_name%.*}"
   out_file="${OUT_DIR}/${stem}.nc"
 
+  if [[ -s "${out_file}" ]]; then
+    echo "SKIP: ${out_file} already exists; ${in_file} already processed."
+    continue
+  fi
+
   echo "Converting ${in_file} -> ${out_file}"
   wgrib2 "${in_file}" -netcdf "${out_file}"
 done
