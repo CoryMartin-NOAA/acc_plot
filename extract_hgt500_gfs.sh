@@ -7,7 +7,9 @@
 #   extract_hgt500_gfs.sh [file1 file2 ...]
 #
 # If no files are given the script searches SRC_DIR (default: current directory)
-# for files matching the GFS pgb naming pattern  pgbf*.gfs.*.
+# for files matching common GFS pgb naming patterns:
+#   pgbf*.gfs.*  (forecast files)
+#   pgbanl*.gfs.* or pgbanl*.gdas.* (analysis files)
 #
 # Environment variables:
 #   SRC_DIR   – directory to scan when no arguments are given  (default: $PWD)
@@ -38,10 +40,10 @@ if [[ $# -gt 0 ]]; then
 else
   while IFS= read -r -d '' f; do
     INPUT_FILES+=("$f")
-  done < <(find "${SRC_DIR}" -maxdepth 1 -name 'pgbf*.gfs.*' \
+  done < <(find "${SRC_DIR}" -maxdepth 1 \( -name 'pgbf*.gfs.*' -o -name 'pgbanl*.gfs.*' -o -name 'pgbanl*.gdas.*' \) \
              ! -name '*.nc' ! -name '*.grb' -print0 | sort -z)
   if [[ ${#INPUT_FILES[@]} -eq 0 ]]; then
-    echo "ERROR: no GFS pgb files found in ${SRC_DIR}" >&2
+    echo "ERROR: no matching pgbf*/pgbanl* files found in ${SRC_DIR}" >&2
     exit 1
   fi
 fi
