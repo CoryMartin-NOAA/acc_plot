@@ -63,16 +63,20 @@ def _open_nc_file(path: Path) -> dict:
         hgt_name = _find_hgt_name(ds)
 
         valid_num = float(time_var[0])
-        valid_dt_raw = nc.num2date(valid_num, units=time_var.units)
-        valid_dt = datetime(
-            valid_dt_raw.year,
-            valid_dt_raw.month,
-            valid_dt_raw.day,
-            valid_dt_raw.hour,
-            valid_dt_raw.minute,
-            int(valid_dt_raw.second),
-            tzinfo=timezone.utc,
-        )
+        units = time_var.units
+        if re.match(r"seconds since 1970-01-01", units):
+            valid_dt = datetime.fromtimestamp(valid_num, tz=timezone.utc)
+        else:
+            valid_dt_raw = nc.num2date(valid_num, units=units)
+            valid_dt = datetime(
+                valid_dt_raw.year,
+                valid_dt_raw.month,
+                valid_dt_raw.day,
+                valid_dt_raw.hour,
+                valid_dt_raw.minute,
+                int(valid_dt_raw.second),
+                tzinfo=timezone.utc,
+            )
 
         # WGRIB2 NetCDF output commonly includes this custom epoch-seconds attribute.
         ref_epoch = getattr(time_var, "reference_time", None)
@@ -112,15 +116,68 @@ def _acc_weighted(forecast_anom: np.ndarray, analysis_anom: np.ndarray, lat: np.
     return float(numer / denom)
 
 
-def _load_climo(climo_dir: Path, mmdd: str) -> dict:
+def _regrid(data: "np.ndarray", src_lat: "np.ndarray", src_lon: "np.ndarray",
+            tgt_lat: "np.ndarray", tgt_lon: "np.ndarray") -> "np.ndarray":
+    """Bilinear interpolation of a 2-D (lat x lon) field onto a target regular grid."""
+    try:
+        from scipy.interpolate import RegularGridInterpolator
+    except ImportError as exc:
+        raise ImportError(
+            "scipy is required when the climatology grid differs from the forecast grid."
+        ) from exc
+    # RegularGridInterpolator requires strictly ascending coordinates.
+    if src_lat[0] > src_lat[-1]:
+        src_lat = src_lat[::-1]
+        data = data[::-1, :]
+    interp = RegularGridInterpolator(
+        (src_lat, src_lon), data, method="linear", bounds_error=False, fill_value=None
+    )
+    tgt_lat_2d, tgt_lon_2d = np.meshgrid(tgt_lat, tgt_lon, indexing="ij")
+    return interp((tgt_lat_2d, tgt_lon_2d))
+
+
+def _load_climo(climo_dir: Path, mmdd: str, valid_hour: int,
+               tgt_lat: "np.ndarray", tgt_lon: "np.ndarray") -> dict:
+    _ensure_dependencies()
     candidates = [
         climo_dir / f"hgt500_climo_{mmdd}.grb.nc",
         climo_dir / f"mean_{mmdd}.nc",
     ]
-    for candidate in candidates:
-        if candidate.exists():
-            return _open_nc_file(candidate)
-    raise FileNotFoundError(f"Climatology file not found for MMDD={mmdd} in {climo_dir}")
+    path = next((c for c in candidates if c.exists()), None)
+    if path is None:
+        raise FileNotFoundError(f"Climatology file not found for MMDD={mmdd} in {climo_dir}")
+
+    with nc.Dataset(path) as ds:
+        lat_name = "latitude" if "latitude" in ds.variables else "lat"
+        lon_name = "longitude" if "longitude" in ds.variables else "lon"
+        src_lat = np.array(ds.variables[lat_name][:], dtype=np.float64)
+        src_lon = np.array(ds.variables[lon_name][:], dtype=np.float64)
+
+        if "var7" in ds.variables:
+            # CDO-converted ERAclim format: var7(time, plev, lat, lon)
+            var = ds.variables["var7"]
+            n_times = var.shape[0]
+            time_idx = min(valid_hour // 6, n_times - 1)
+            hgt = np.array(var[time_idx, 0, :, :], dtype=np.float64)
+        else:
+            hgt_name = _find_hgt_name(ds)
+            var = ds.variables[hgt_name]
+            n_times = var.shape[0]
+            time_idx = min(valid_hour // 6, n_times - 1) if n_times > 1 else 0
+            hgt = np.array(var[time_idx, :, :], dtype=np.float64)
+
+        fill_value = getattr(var, "_FillValue", None)
+        if fill_value is not None:
+            hgt = np.where(np.isclose(hgt, float(fill_value)), np.nan, hgt)
+
+    # Interpolate onto the forecast/analysis grid when resolutions differ.
+    if src_lat.shape != tgt_lat.shape or src_lon.shape != tgt_lon.shape or not (
+        np.allclose(src_lat, tgt_lat, atol=1e-6, rtol=1e-9)
+        and np.allclose(src_lon, tgt_lon, atol=1e-6, rtol=1e-9)
+    ):
+        hgt = _regrid(hgt, src_lat, src_lon, tgt_lat, tgt_lon)
+
+    return {"hgt": hgt, "lat": tgt_lat, "lon": tgt_lon}
 
 
 def _list_nc_files(directory: Path) -> list[Path]:
@@ -179,12 +236,13 @@ def main() -> None:
             raise ValueError(f"Grid mismatch between forecast and analysis for {path}")
 
         mmdd = fcst["valid_dt"].strftime("%m%d")
-        if mmdd not in cached_climo:
-            cached_climo[mmdd] = _load_climo(args.climo_dir, mmdd)
-        climo = cached_climo[mmdd]
-        grids_match_climo = _same_grid(fcst, climo)
-        if not grids_match_climo:
-            raise ValueError(f"Grid mismatch between forecast and climatology for {path}")
+        valid_hour = fcst["valid_dt"].hour
+        climo_key = (mmdd, valid_hour)
+        if climo_key not in cached_climo:
+            cached_climo[climo_key] = _load_climo(
+                args.climo_dir, mmdd, valid_hour, fcst["lat"], fcst["lon"]
+            )
+        climo = cached_climo[climo_key]
 
         fcst_anom = fcst["hgt"] - climo["hgt"]
         anly_anom = analysis["hgt"] - climo["hgt"]
