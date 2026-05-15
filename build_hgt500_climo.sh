@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CLIMO_SRC_DIR="${CLIMO_SRC_DIR:-/lfs/h2/emc/vpppg/noscrub/emc.vpppg/verification/EVS_fix/climos/atmos/era5}"
-OUT_DIR="${OUT_DIR:-/lfs/h2/emc/ptmp/${USER}}"
+OUT_DIR="${OUT_DIR:-/lfs/h2/emc/ptmp/${USER}/climo}"
 
 if ! command -v wgrib >/dev/null 2>&1; then
   echo "ERROR: wgrib is required but not found in PATH." >&2
