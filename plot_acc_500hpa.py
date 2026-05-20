@@ -146,17 +146,27 @@ def _acc_weighted(forecast_anom: np.ndarray, analysis_anom: np.ndarray, lat: np.
     if lat.ndim != 1:
         raise ValueError("Latitude coordinate must be 1D for cosine-latitude ACC weighting.")
 
-    weights = np.cos(np.deg2rad(lat))[:, None]
+    # Apply sqrt(cos(lat)) weighting after removing spatial means.
+    weights = np.sqrt(np.cos(np.deg2rad(lat)))[:, None]
     valid = np.isfinite(forecast_anom) & np.isfinite(analysis_anom)
     if not np.any(valid):
         return np.nan
 
-    f = np.where(valid, forecast_anom, 0.0)
-    a = np.where(valid, analysis_anom, 0.0)
-    w = np.where(valid, weights, 0.0)
+    f = np.where(valid, forecast_anom, np.nan)
+    a = np.where(valid, analysis_anom, np.nan)
 
-    numer = np.sum(w * f * a)
-    denom = np.sqrt(np.sum(w * f * f) * np.sum(w * a * a))
+    # Remove the spatial mean over valid points for each field.
+    f_mean = float(np.nanmean(f))
+    a_mean = float(np.nanmean(a))
+    f = np.where(valid, f - f_mean, 0.0)
+    a = np.where(valid, a - a_mean, 0.0)
+
+    w = np.where(valid, weights, 0.0)
+    f = w * f
+    a = w * a
+
+    numer = np.sum(f * a)
+    denom = np.sqrt(np.sum(f * f) * np.sum(a * a))
     if np.isclose(denom, 0.0):
         return np.nan
     return float(numer / denom)
@@ -240,6 +250,39 @@ def _mean_by_leads(acc_by_lead: dict, leads: list[int]) -> list[float]:
     return [float(np.nanmean(acc_by_lead[lead])) if lead in acc_by_lead else np.nan for lead in leads]
 
 
+def _paired_diff_ci95(
+    control_by_valid: dict,
+    experiment_by_valid: dict,
+) -> tuple[float, float, float]:
+    """Return mean(exp-ctrl), lower95, upper95 from date-matched paired t interval."""
+    try:
+        from scipy.stats import t as student_t
+    except ImportError as exc:
+        raise ImportError("scipy is required to compute paired t confidence intervals.") from exc
+
+    common_dates = sorted(set(control_by_valid.keys()) & set(experiment_by_valid.keys()))
+    if not common_dates:
+        return np.nan, np.nan, np.nan
+
+    ctrl = np.array([control_by_valid[dt] for dt in common_dates], dtype=np.float64)
+    exp = np.array([experiment_by_valid[dt] for dt in common_dates], dtype=np.float64)
+    valid = np.isfinite(ctrl) & np.isfinite(exp)
+    if not np.any(valid):
+        return np.nan, np.nan, np.nan
+
+    diff = exp[valid] - ctrl[valid]
+    n = diff.size
+    mean_diff = float(np.mean(diff))
+    if n < 2:
+        return mean_diff, mean_diff, mean_diff
+
+    std = float(np.std(diff, ddof=1))
+    stderr = std / np.sqrt(n)
+    tcrit = float(student_t.ppf(0.975, df=n - 1))
+    ci_half = tcrit * stderr
+    return mean_diff, mean_diff - ci_half, mean_diff + ci_half
+
+
 def main() -> None:
     args = parse_args()
 
@@ -256,15 +299,35 @@ def main() -> None:
         raise ValueError("Analysis, control, and experiment directories must each contain .nc files.")
 
     analysis_by_valid = {}
+    n_analysis_f00 = 0
     for path in analysis_files:
         info = _open_nc_file(path)
+        # Enforce analysis inputs to be f00 only.
+        if info["ref_dt"] is not None:
+            lead = int(round((info["valid_dt"] - info["ref_dt"]).total_seconds() / 3600.0))
+            if lead != 0:
+                continue
+        else:
+            # Fallback when reference_time is unavailable: only accept explicit f00 naming.
+            if not re.search(r"(?:pgbf|f)0{2,3}(?:\D|$)", path.name, flags=re.IGNORECASE):
+                continue
         analysis_by_valid[info["valid_dt"]] = info
+        n_analysis_f00 += 1
+
+    if n_analysis_f00 == 0:
+        raise ValueError(
+            "No f00 analysis files found in analysis-dir. "
+            "Provide analysis files with lead 0 only."
+        )
 
     cached_climo = {}
     control_acc_by_lead = defaultdict(list)
     experiment_acc_by_lead = defaultdict(list)
+    control_acc_by_lead_valid = defaultdict(dict)
+    experiment_acc_by_lead_valid = defaultdict(dict)
+    used_valid_dates = set()
 
-    def process_forecast(path: Path, target: defaultdict) -> None:
+    def process_forecast(path: Path, target: defaultdict, target_by_valid: defaultdict) -> None:
         fcst = _open_nc_file(path)
         if fcst["ref_dt"] is None:
             raise ValueError(f"No time:reference_time attribute in {path}")
@@ -292,12 +355,15 @@ def main() -> None:
 
         fcst_anom = fcst["hgt"] - climo["hgt"]
         anly_anom = analysis["hgt"] - climo["hgt"]
-        target[lead].append(_acc_weighted(fcst_anom, anly_anom, fcst["lat"]))
+        acc_value = _acc_weighted(fcst_anom, anly_anom, fcst["lat"])
+        target[lead].append(acc_value)
+        target_by_valid[lead][fcst["valid_dt"]] = acc_value
+        used_valid_dates.add(fcst["valid_dt"])
 
     for path in control_files:
-        process_forecast(path, control_acc_by_lead)
+        process_forecast(path, control_acc_by_lead, control_acc_by_lead_valid)
     for path in experiment_files:
-        process_forecast(path, experiment_acc_by_lead)
+        process_forecast(path, experiment_acc_by_lead, experiment_acc_by_lead_valid)
 
     leads = sorted(set(control_acc_by_lead.keys()) | set(experiment_acc_by_lead.keys()))
     if not leads:
@@ -306,29 +372,127 @@ def main() -> None:
     control_acc = _mean_by_leads(control_acc_by_lead, leads)
     experiment_acc = _mean_by_leads(experiment_acc_by_lead, leads)
 
-    plt.figure(figsize=(9, 5))
-    plt.plot(leads, control_acc, marker="o", linestyle="-", label="Control Run")
-    plt.plot(leads, experiment_acc, marker="s", linestyle="--", label="Experiment")
-    plt.axhline(0.0, color="k", linewidth=0.8)
-    plt.axhline(
+    diff_mean = []
+    diff_low = []
+    diff_high = []
+    for lead in leads:
+        mean_diff, low95, high95 = _paired_diff_ci95(
+            control_acc_by_lead_valid.get(lead, {}),
+            experiment_acc_by_lead_valid.get(lead, {}),
+        )
+        diff_mean.append(mean_diff)
+        diff_low.append(low95)
+        diff_high.append(high95)
+
+    used_dates_sorted = sorted(used_valid_dates)
+    if used_dates_sorted:
+        start_dt = used_dates_sorted[0].strftime("%Y-%m-%d %HZ")
+        end_dt = used_dates_sorted[-1].strftime("%Y-%m-%d %HZ")
+        dates_text = f"Dates used: {start_dt} to {end_dt} (n={len(used_dates_sorted)})"
+    else:
+        dates_text = "Dates used: none"
+
+    fig, (ax_abs, ax_diff) = plt.subplots(
+        2, 1, figsize=(10, 8), sharex=True, gridspec_kw={"height_ratios": [3, 2]}
+    )
+
+    ax_abs.plot(leads, control_acc, marker="o", linestyle="-", label="Control Run")
+    ax_abs.plot(leads, experiment_acc, marker="s", linestyle="--", label="Experiment")
+    ax_abs.axhline(
         SKILL_THRESHOLD,
         color="gray",
         linestyle=":",
         linewidth=1.0,
         label=f"Skill Threshold ({SKILL_THRESHOLD:.1f})",
     )
-    plt.ylim(-0.2, 1.0)
-    plt.xlim(0, args.max_lead)
-    plt.xlabel("Lead time (hours)")
-    plt.ylabel("ACC")
-    plt.title("500 hPa Geopotential Height ACC")
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.legend()
-    plt.tight_layout()
+    x_ticks = [0, 24, 48, 72, 96, 120, 144, 168, 192]
+    ax_abs.set_ylim(0.6, 1.0)
+    ax_abs.set_xlim(0, 192)
+    ax_abs.set_xticks(x_ticks)
+    ax_abs.set_ylabel("ACC")
+    ax_abs.set_title(f"500 hPa Geopotential Height ACC\n{dates_text}")
+    ax_abs.grid(True, linestyle="--", alpha=0.4)
+    ax_abs.legend()
+
+    ci_low_arr = np.array(diff_low, dtype=np.float64)
+    ci_high_arr = np.array(diff_high, dtype=np.float64)
+    ci_half = 0.5 * (ci_high_arr - ci_low_arr)
+    ax_diff.bar(
+        leads,
+        2.0 * ci_half,
+        bottom=-ci_half,
+        width=8,
+        color="tab:orange",
+        alpha=0.25,
+        edgecolor="tab:orange",
+        linewidth=0.8,
+        label="95% CI (centered on 0)",
+    )
+    ax_diff.plot(leads, diff_mean, marker="d", linestyle="-", color="tab:red", label="Exp - Ctrl")
+    ax_diff.axhline(0.0, color="k", linewidth=0.8)
+    ax_diff.set_xticks(x_ticks)
+    ax_diff.set_xlabel("Lead time (hours)")
+    ax_diff.set_ylabel("ACC Difference")
+    ax_diff.grid(True, linestyle="--", alpha=0.4)
+    ax_diff.set_ylim(-0.02, 0.025)
+    ax_diff.legend()
+
+    fig.tight_layout()
 
     args.output_plot.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(args.output_plot, dpi=150)
+    fig.savefig(args.output_plot, dpi=150)
     print(f"Saved plot to {args.output_plot}")
+
+    target_lead = 120
+    control_ts_map = control_acc_by_lead_valid.get(target_lead, {})
+    experiment_ts_map = experiment_acc_by_lead_valid.get(target_lead, {})
+    common_valid_dates = sorted(set(control_ts_map.keys()) & set(experiment_ts_map.keys()))
+
+    if common_valid_dates:
+        control_ts = [control_ts_map[dt] for dt in common_valid_dates]
+        experiment_ts = [experiment_ts_map[dt] for dt in common_valid_dates]
+        diff_ts = [exp - ctrl for ctrl, exp in zip(control_ts, experiment_ts)]
+
+        ts_start = common_valid_dates[0].strftime("%Y-%m-%d %HZ")
+        ts_end = common_valid_dates[-1].strftime("%Y-%m-%d %HZ")
+        ts_dates_text = f"Dates used: {ts_start} to {ts_end} (n={len(common_valid_dates)})"
+
+        fig_ts, (ax_ts_abs, ax_ts_diff) = plt.subplots(
+            2, 1, figsize=(11, 8), sharex=True, gridspec_kw={"height_ratios": [3, 2]}
+        )
+
+        ax_ts_abs.plot(common_valid_dates, control_ts, marker="o", linestyle="-", label="Control Run")
+        ax_ts_abs.plot(common_valid_dates, experiment_ts, marker="s", linestyle="--", label="Experiment")
+        ax_ts_abs.axhline(
+            SKILL_THRESHOLD,
+            color="gray",
+            linestyle=":",
+            linewidth=1.0,
+            label=f"Skill Threshold ({SKILL_THRESHOLD:.1f})",
+        )
+        ax_ts_abs.set_ylim(0.5, 1.0)
+        ax_ts_abs.set_ylabel("ACC")
+        ax_ts_abs.set_title(f"500 hPa ACC Time Series at {target_lead}h Lead\n{ts_dates_text}")
+        ax_ts_abs.grid(True, linestyle="--", alpha=0.4)
+        ax_ts_abs.legend()
+
+        ax_ts_diff.plot(common_valid_dates, diff_ts, marker="d", linestyle="-", color="tab:red", label="Exp - Ctrl")
+        ax_ts_diff.axhline(0.0, color="k", linewidth=0.8)
+        ax_ts_diff.set_xlabel("Valid time (UTC)")
+        ax_ts_diff.set_ylabel("ACC Difference")
+        ax_ts_diff.grid(True, linestyle="--", alpha=0.4)
+        ax_ts_diff.legend()
+
+        fig_ts.autofmt_xdate(rotation=30)
+        fig_ts.tight_layout()
+
+        ts_plot = args.output_plot.with_name(
+            f"{args.output_plot.stem}_timeseries_f{target_lead:03d}{args.output_plot.suffix}"
+        )
+        fig_ts.savefig(ts_plot, dpi=150)
+        print(f"Saved plot to {ts_plot}")
+    else:
+        print(f"No matched control/experiment dates found for {target_lead}h time-series plot.")
 
 
 if __name__ == "__main__":
