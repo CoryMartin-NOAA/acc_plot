@@ -50,8 +50,23 @@ Converts one or more GRIB2 files using:
 
 `wgrib2 input_file.grib2 -netcdf output_file.nc`
 
+You can also point it at a root directory; it will recursively find all
+`*.grib2` files and write all outputs into one flat directory (`OUT_DIR`).
+
+For paths shaped like:
+
+`.../aigfs.YYYYMMDD/HH/aigfs.tHHz.pres.fFFF.grib2`
+
+the output filename is rewritten as:
+
+`pgbfFF.aigfs.YYYYMMDDHH.grib2.nc`
+
 Example:
 
 ```bash
 OUT_DIR=/lfs/h2/emc/ptmp/${USER} bash ./convert_grib2_to_netcdf.sh /path/to/experiment/*.grib2
+
+# Recursive mode from a product root:
+OUT_DIR=/lfs/h2/emc/ptmp/${USER} \
+  bash ./convert_grib2_to_netcdf.sh /lfs/h2/emc/da/noscrub/cory.r.martin/aigfs/com/prod_ic
 ```
