@@ -14,6 +14,7 @@ SKILL_THRESHOLD = 0.6
 
 # Common GRIB2 file suffixes recognised when scanning input directories.
 _GRIB2_SUFFIXES = frozenset({".grb2", ".grib2", ".grb", ".grib"})
+_GRIB_MAGIC = b"GRIB"
 
 
 def parse_args() -> argparse.Namespace:
@@ -201,10 +202,20 @@ def _load_climo(climo_dir: Path, mmdd: str, valid_hour: int,
     return {"hgt": hgt, "lat": tgt_lat, "lon": tgt_lon}
 
 
+def _looks_like_grib(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            return fh.read(len(_GRIB_MAGIC)) == _GRIB_MAGIC
+    except OSError:
+        return False
+
+
 def _list_grib2_files(directory: Path) -> list[Path]:
     return sorted(
-        p for p in directory.iterdir()
-        if p.is_file() and p.suffix.lower() in _GRIB2_SUFFIXES
+        p for p in directory.rglob("*")
+        if p.is_file() and (
+            p.suffix.lower() in _GRIB2_SUFFIXES or _looks_like_grib(p)
+        )
     )
 
 
