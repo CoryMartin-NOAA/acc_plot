@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 
@@ -33,6 +33,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--climo-dir", required=True, type=Path)
     parser.add_argument("--output-plot", required=True, type=Path)
     parser.add_argument("--max-lead", type=int, default=120)
+    # Date-range file discovery (replaces recursive directory scanning when provided).
+    parser.add_argument(
+        "--start-date", default=None,
+        help="First cycle date in YYYYMMDD or YYYY-MM-DD format.  When provided with "
+             "--end-date the script builds an explicit list of expected files based on "
+             "6-hourly cycling and --forecast-interval steps instead of scanning "
+             "directories recursively.",
+    )
+    parser.add_argument(
+        "--end-date", default=None,
+        help="Last cycle date in YYYYMMDD or YYYY-MM-DD format (inclusive).",
+    )
+    parser.add_argument(
+        "--experiment-model", default="gfs",
+        help="Model name used in experiment file/directory names (e.g. gfs, aigfs). "
+             "Default: gfs",
+    )
+    parser.add_argument(
+        "--analysis-model", default="gdas",
+        help="Model name used in analysis file/directory names (e.g. gdas, gfs). "
+             "Default: gdas",
+    )
+    parser.add_argument(
+        "--control-model", default="gfs",
+        help="Model name used in control file/directory names (e.g. gfs, gdas). "
+             "Default: gfs",
+    )
+    parser.add_argument(
+        "--cycle-interval", type=int, default=6,
+        help="Cycle interval in hours used when generating expected file paths "
+             "(date-range mode only). Default: 6",
+    )
+    parser.add_argument(
+        "--forecast-interval", type=int, default=6,
+        help="Forecast-hour step used when generating expected file paths "
+             "(date-range mode only). Default: 6",
+    )
     return parser.parse_args()
 
 
@@ -302,6 +339,51 @@ def _mean_by_leads(acc_by_lead: dict, leads: list[int]) -> list[float]:
     return [float(np.nanmean(acc_by_lead[lead])) if lead in acc_by_lead else np.nan for lead in leads]
 
 
+def _parse_date_arg(s: str) -> datetime:
+    """Parse a YYYYMMDD or YYYY-MM-DD date string, returning midnight UTC."""
+    for fmt in ("%Y%m%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise ValueError(f"Cannot parse date: {s!r}. Expected YYYYMMDD or YYYY-MM-DD.")
+
+
+def _iter_cycles(start_dt: datetime, end_dt: datetime, interval_hours: int = 6):
+    """Yield cycle datetimes from start_dt to end_dt (inclusive) at interval_hours steps."""
+    current = start_dt
+    while current <= end_dt:
+        yield current
+        current += timedelta(hours=interval_hours)
+
+
+def _expected_paths(base_dir: Path, model: str, cycle_dt: datetime, lead_h: int) -> list[Path]:
+    """Return candidate file paths for a model/cycle/lead combination, ordered by likelihood.
+
+    Tries common NOAA GFS/GDAS directory layouts and file-naming conventions so the
+    caller can simply take the first path that exists on disk.
+    """
+    ymd = cycle_dt.strftime("%Y%m%d")
+    cc = cycle_dt.strftime("%H")
+    fstr = f"{lead_h:03d}"
+    stem = f"{model}.t{cc}z"
+    subdirs = [
+        f"{model}.{ymd}/{cc}/atmos",
+        f"{model}.{ymd}/{cc}",
+        f"{model}.{ymd}",
+        f"{ymd}/{cc}/atmos",
+        f"{ymd}/{cc}",
+        ymd,
+    ]
+    file_names = [
+        f"{stem}.pgrb2.0p25.f{fstr}",
+        f"{stem}.pgrb2.0p50.f{fstr}",
+        f"{stem}.pgrb2.1p00.f{fstr}",
+        f"{stem}.pgrbf{fstr}",
+    ]
+    return [base_dir / sd / fn for sd in subdirs for fn in file_names]
+
+
 def _try_open_forecast_file(path: Path, dataset_name: str) -> dict | None:
     try:
         return _open_grib2_file(path)
@@ -355,122 +437,222 @@ def main() -> None:
     if args.max_lead > _MAX_ACC_LEAD_HOURS:
         print(f"--max-lead {args.max_lead} exceeds {_MAX_ACC_LEAD_HOURS}; using {_MAX_ACC_LEAD_HOURS}.")
 
-    print(f"Scanning experiment directory: {args.experiment_dir}")
+    use_date_range = args.start_date is not None
+    if use_date_range:
+        if args.end_date is None:
+            raise ValueError("--end-date is required when --start-date is provided.")
+        start_dt = _parse_date_arg(args.start_date)
+        end_dt = _parse_date_arg(args.end_date)
+        if end_dt < start_dt:
+            raise ValueError("--end-date must not be before --start-date.")
+        print(
+            f"Date-range mode: {start_dt.date()} to {end_dt.date()}, "
+            f"cycle interval {args.cycle_interval}h, "
+            f"forecast interval {args.forecast_interval}h, "
+            f"max lead {max_lead}h"
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Experiment file discovery                                           #
+    # ------------------------------------------------------------------ #
     experiment_forecasts = []
     experiment_valid_dates = set()
     experiment_cycles = set()
-    n_experiment_files = 0
-    n_experiment_skipped = 0
-    for path in _iter_grib2_files(args.experiment_dir):
-        n_experiment_files += 1
-        if n_experiment_files == 1 or n_experiment_files % _PROGRESS_EVERY == 0:
-            print(f"  Experiment scan: inspected {n_experiment_files} files...")
-        fcst = _try_open_forecast_file(path, "Experiment")
-        if fcst is None:
-            n_experiment_skipped += 1
-            continue
-        lead = int(round((fcst["valid_dt"] - fcst["ref_dt"]).total_seconds() / 3600.0))
-        if lead < 0 or lead > max_lead:
-            continue
-        experiment_forecasts.append((path, fcst))
-        experiment_valid_dates.add(fcst["valid_dt"])
-        experiment_cycles.add(fcst["ref_dt"])
-    if n_experiment_files == 0:
-        raise ValueError(
-            "Experiment directory must contain GRIB2 files "
-            f"({', '.join(sorted(_GRIB2_SUFFIXES))})."
-        )
-    if not experiment_forecasts:
-        raise ValueError(
-            f"No experiment forecast files within 0-{max_lead}h lead were found."
-        )
-    print(
-        "Experiment scan complete: "
-        f"{len(experiment_forecasts)} usable files covering "
-        f"{_describe_dates(experiment_valid_dates)}; skipped {n_experiment_skipped} files."
-    )
-    experiment_cycles_sorted = sorted(experiment_cycles)
-    print(
-        "Experiment cycles: "
-        f"{_format_dt(experiment_cycles_sorted[0])} to "
-        f"{_format_dt(experiment_cycles_sorted[-1])} "
-        f"(n={len(experiment_cycles_sorted)})"
-    )
 
+    if use_date_range:
+        print(
+            f"Building {args.experiment_model} experiment file list "
+            f"({start_dt.date()} to {end_dt.date()})..."
+        )
+        n_exp_missing = 0
+        for cycle_dt in _iter_cycles(start_dt, end_dt, args.cycle_interval):
+            for lead_h in range(0, max_lead + 1, args.forecast_interval):
+                found = False
+                for path in _expected_paths(
+                    args.experiment_dir, args.experiment_model, cycle_dt, lead_h
+                ):
+                    if path.exists():
+                        fcst = _try_open_forecast_file(path, "Experiment")
+                        if fcst is not None:
+                            experiment_forecasts.append((path, fcst))
+                            experiment_valid_dates.add(fcst["valid_dt"])
+                            experiment_cycles.add(fcst["ref_dt"])
+                            found = True
+                        break
+                if not found:
+                    n_exp_missing += 1
+        if not experiment_forecasts:
+            raise ValueError(
+                f"No {args.experiment_model} experiment files found for the specified date range "
+                f"in {args.experiment_dir}."
+            )
+        print(
+            f"Experiment discovery complete: {len(experiment_forecasts)} files found, "
+            f"{n_exp_missing} expected paths missing."
+        )
+    else:
+        print(f"Scanning experiment directory: {args.experiment_dir}")
+        n_experiment_files = 0
+        n_experiment_skipped = 0
+        for path in _iter_grib2_files(args.experiment_dir):
+            n_experiment_files += 1
+            if n_experiment_files == 1 or n_experiment_files % _PROGRESS_EVERY == 0:
+                print(f"  Experiment scan: inspected {n_experiment_files} files...")
+            fcst = _try_open_forecast_file(path, "Experiment")
+            if fcst is None:
+                n_experiment_skipped += 1
+                continue
+            lead = int(round((fcst["valid_dt"] - fcst["ref_dt"]).total_seconds() / 3600.0))
+            if lead < 0 or lead > max_lead:
+                continue
+            experiment_forecasts.append((path, fcst))
+            experiment_valid_dates.add(fcst["valid_dt"])
+            experiment_cycles.add(fcst["ref_dt"])
+        if n_experiment_files == 0:
+            raise ValueError(
+                "Experiment directory must contain GRIB2 files "
+                f"({', '.join(sorted(_GRIB2_SUFFIXES))})."
+            )
+        if not experiment_forecasts:
+            raise ValueError(
+                f"No experiment forecast files within 0-{max_lead}h lead were found."
+            )
+        print(
+            "Experiment scan complete: "
+            f"{len(experiment_forecasts)} usable files covering "
+            f"{_describe_dates(experiment_valid_dates)}; skipped {n_experiment_skipped} files."
+        )
+        experiment_cycles_sorted = sorted(experiment_cycles)
+        print(
+            "Experiment cycles: "
+            f"{_format_dt(experiment_cycles_sorted[0])} to "
+            f"{_format_dt(experiment_cycles_sorted[-1])} "
+            f"(n={len(experiment_cycles_sorted)})"
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Analysis file discovery                                             #
+    # ------------------------------------------------------------------ #
     analysis_by_valid = {}
-    n_analysis_f00 = 0
-    n_analysis_skipped = 0
-    analysis_cycle_roots = _index_cycle_roots(args.analysis_dir)
-    analysis_targets = sorted(experiment_valid_dates)
-    print(
-        f"Locating analysis files in: {args.analysis_dir} "
-        f"for {len(analysis_targets)} experiment valid dates"
-    )
-    n_analysis_files = 0
-    if analysis_cycle_roots:
-        for target_dt in analysis_targets:
-            paths = _find_cycle_files(analysis_cycle_roots, target_dt, lead_hours=0)
-            n_analysis_files += len(paths)
-            if n_analysis_files == 1 or n_analysis_files % _PROGRESS_EVERY == 0:
-                print(f"  Analysis lookup: inspected {n_analysis_files} candidate files...")
-            for path in paths:
+
+    if use_date_range:
+        analysis_model = args.analysis_model
+        print(
+            f"Locating {analysis_model} analysis (f000) files in: {args.analysis_dir} "
+            f"for {len(experiment_valid_dates)} experiment valid dates"
+        )
+        n_analysis_missing = 0
+        for valid_dt in sorted(experiment_valid_dates):
+            found = False
+            for path in _expected_paths(args.analysis_dir, analysis_model, valid_dt, 0):
+                if path.exists():
+                    info = _try_open_forecast_file(path, "Analysis")
+                    if info is not None:
+                        lead = int(
+                            round(
+                                (info["valid_dt"] - info["ref_dt"]).total_seconds() / 3600.0
+                            )
+                        )
+                        if lead == 0:
+                            analysis_by_valid[valid_dt] = info
+                            found = True
+                    break
+            if not found:
+                n_analysis_missing += 1
+        if not analysis_by_valid:
+            raise ValueError(
+                f"No {analysis_model} f000 analysis files found for the specified date range "
+                f"in {args.analysis_dir}."
+            )
+        matched_analysis_dates = set(analysis_by_valid) & experiment_valid_dates
+        print(
+            f"Analysis discovery complete: matched {len(matched_analysis_dates)} of "
+            f"{len(experiment_valid_dates)} experiment valid dates; "
+            f"{n_analysis_missing} expected paths missing."
+        )
+    else:
+        n_analysis_f00 = 0
+        n_analysis_skipped = 0
+        analysis_cycle_roots = _index_cycle_roots(args.analysis_dir)
+        analysis_targets = sorted(experiment_valid_dates)
+        print(
+            f"Locating analysis files in: {args.analysis_dir} "
+            f"for {len(analysis_targets)} experiment valid dates"
+        )
+        n_analysis_files = 0
+        if analysis_cycle_roots:
+            for target_dt in analysis_targets:
+                paths = _find_cycle_files(analysis_cycle_roots, target_dt, lead_hours=0)
+                n_analysis_files += len(paths)
+                if n_analysis_files == 1 or n_analysis_files % _PROGRESS_EVERY == 0:
+                    print(f"  Analysis lookup: inspected {n_analysis_files} candidate files...")
+                for path in paths:
+                    info = _try_open_forecast_file(path, "Analysis")
+                    if info is None:
+                        n_analysis_skipped += 1
+                        continue
+                    # Enforce analysis inputs to be f00 only (lead == 0).
+                    lead = int(
+                        round(
+                            (info["valid_dt"] - info["ref_dt"]).total_seconds() / 3600.0
+                        )
+                    )
+                    if lead != 0 or info["valid_dt"] != target_dt:
+                        continue
+                    analysis_by_valid[info["valid_dt"]] = info
+                    n_analysis_f00 += 1
+                    print(
+                        "  Matched analysis valid time "
+                        f"{_format_dt(info['valid_dt'])} "
+                        f"({len(set(analysis_by_valid) & experiment_valid_dates)}/"
+                        f"{len(experiment_valid_dates)})"
+                    )
+                    break
+        else:
+            print("  Analysis directory layout not inferred from cycles; falling back to recursive scan.")
+            for path in _iter_grib2_files(args.analysis_dir):
+                n_analysis_files += 1
+                if n_analysis_files == 1 or n_analysis_files % _PROGRESS_EVERY == 0:
+                    print(f"  Analysis scan: inspected {n_analysis_files} files...")
                 info = _try_open_forecast_file(path, "Analysis")
                 if info is None:
                     n_analysis_skipped += 1
                     continue
                 # Enforce analysis inputs to be f00 only (lead == 0).
-                lead = int(round((info["valid_dt"] - info["ref_dt"]).total_seconds() / 3600.0))
-                if lead != 0 or info["valid_dt"] != target_dt:
+                lead = int(
+                    round((info["valid_dt"] - info["ref_dt"]).total_seconds() / 3600.0)
+                )
+                if lead != 0:
                     continue
                 analysis_by_valid[info["valid_dt"]] = info
                 n_analysis_f00 += 1
-                print(
-                    "  Matched analysis valid time "
-                    f"{_format_dt(info['valid_dt'])} "
-                    f"({len(set(analysis_by_valid) & experiment_valid_dates)}/"
-                    f"{len(experiment_valid_dates)})"
-                )
-                break
-    else:
-        print("  Analysis directory layout not inferred from cycles; falling back to recursive scan.")
-        for path in _iter_grib2_files(args.analysis_dir):
-            n_analysis_files += 1
-            if n_analysis_files == 1 or n_analysis_files % _PROGRESS_EVERY == 0:
-                print(f"  Analysis scan: inspected {n_analysis_files} files...")
-            info = _try_open_forecast_file(path, "Analysis")
-            if info is None:
-                n_analysis_skipped += 1
-                continue
-            # Enforce analysis inputs to be f00 only (lead == 0).
-            lead = int(round((info["valid_dt"] - info["ref_dt"]).total_seconds() / 3600.0))
-            if lead != 0:
-                continue
-            analysis_by_valid[info["valid_dt"]] = info
-            n_analysis_f00 += 1
-            if info["valid_dt"] in experiment_valid_dates:
-                print(
-                    "  Matched analysis valid time "
-                    f"{_format_dt(info['valid_dt'])} "
-                    f"({len(set(analysis_by_valid) & experiment_valid_dates)}/"
-                    f"{len(experiment_valid_dates)})"
-                )
-                if experiment_valid_dates.issubset(analysis_by_valid):
-                    print("  Found all experiment dates in analysis directory; stopping early.")
-                    break
+                if info["valid_dt"] in experiment_valid_dates:
+                    print(
+                        "  Matched analysis valid time "
+                        f"{_format_dt(info['valid_dt'])} "
+                        f"({len(set(analysis_by_valid) & experiment_valid_dates)}/"
+                        f"{len(experiment_valid_dates)})"
+                    )
+                    if experiment_valid_dates.issubset(analysis_by_valid):
+                        print("  Found all experiment dates in analysis directory; stopping early.")
+                        break
 
-    if n_analysis_f00 == 0:
-        raise ValueError(
-            "No f00 analysis files found in analysis-dir. "
-            "Provide analysis files with lead 0 only."
+        if n_analysis_f00 == 0:
+            raise ValueError(
+                "No f00 analysis files found in analysis-dir. "
+                "Provide analysis files with lead 0 only."
+            )
+        matched_analysis_dates = set(analysis_by_valid) & experiment_valid_dates
+        print(
+            "Analysis scan complete: "
+            f"matched {len(matched_analysis_dates)} of {len(experiment_valid_dates)} "
+            f"experiment valid dates after inspecting {n_analysis_files} files; "
+            f"skipped {n_analysis_skipped} files."
         )
-    matched_analysis_dates = set(analysis_by_valid) & experiment_valid_dates
-    print(
-        "Analysis scan complete: "
-        f"matched {len(matched_analysis_dates)} of {len(experiment_valid_dates)} "
-        f"experiment valid dates after inspecting {n_analysis_files} files; "
-        f"skipped {n_analysis_skipped} files."
-    )
 
+    # ------------------------------------------------------------------ #
+    #  ACC computation helpers                                             #
+    # ------------------------------------------------------------------ #
     cached_climo = {}
     control_acc_by_lead = defaultdict(list)
     experiment_acc_by_lead = defaultdict(list)
@@ -507,57 +689,85 @@ def main() -> None:
         used_valid_dates.add(fcst["valid_dt"])
         return True
 
-    print(f"Scanning control directory: {args.control_dir}")
-    control_cycle_roots = _index_cycle_roots(args.control_dir)
-    control_targets = sorted(
-        {
-            (
-                fcst["ref_dt"],
-                int(round((fcst["valid_dt"] - fcst["ref_dt"]).total_seconds() / 3600.0)),
-            )
-            for _, fcst in experiment_forecasts
-        }
-    )
+    # ------------------------------------------------------------------ #
+    #  Control file discovery and ACC computation                         #
+    # ------------------------------------------------------------------ #
     n_control_files = 0
     n_control_matches = 0
     n_control_skipped = 0
-    if control_cycle_roots:
-        for ref_dt, lead_hours in control_targets:
-            paths = _find_cycle_files(control_cycle_roots, ref_dt, lead_hours=lead_hours)
-            n_control_files += len(paths)
-            if n_control_files == 1 or n_control_files % _PROGRESS_EVERY == 0:
-                print(f"  Control lookup: inspected {n_control_files} candidate files...")
-            for path in paths:
+
+    if use_date_range:
+        print(
+            f"Processing {args.control_model} control files "
+            f"({start_dt.date()} to {end_dt.date()})..."
+        )
+        for cycle_dt in _iter_cycles(start_dt, end_dt, args.cycle_interval):
+            for lead_h in range(0, max_lead + 1, args.forecast_interval):
+                for path in _expected_paths(
+                    args.control_dir, args.control_model, cycle_dt, lead_h
+                ):
+                    if path.exists():
+                        n_control_files += 1
+                        fcst = _try_open_forecast_file(path, "Control")
+                        if fcst is None:
+                            n_control_skipped += 1
+                        elif process_forecast(
+                            path, fcst, control_acc_by_lead, control_acc_by_lead_valid
+                        ):
+                            n_control_matches += 1
+                        break
+    else:
+        print(f"Scanning control directory: {args.control_dir}")
+        control_cycle_roots = _index_cycle_roots(args.control_dir)
+        control_targets = sorted(
+            {
+                (
+                    fcst["ref_dt"],
+                    int(round((fcst["valid_dt"] - fcst["ref_dt"]).total_seconds() / 3600.0)),
+                )
+                for _, fcst in experiment_forecasts
+            }
+        )
+        if control_cycle_roots:
+            for ref_dt, lead_hours in control_targets:
+                paths = _find_cycle_files(control_cycle_roots, ref_dt, lead_hours=lead_hours)
+                n_control_files += len(paths)
+                if n_control_files == 1 or n_control_files % _PROGRESS_EVERY == 0:
+                    print(f"  Control lookup: inspected {n_control_files} candidate files...")
+                for path in paths:
+                    fcst = _try_open_forecast_file(path, "Control")
+                    if fcst is None:
+                        n_control_skipped += 1
+                        continue
+                    if process_forecast(path, fcst, control_acc_by_lead, control_acc_by_lead_valid):
+                        n_control_matches += 1
+                        break
+        else:
+            print("  Control directory layout not inferred from cycles; falling back to recursive scan.")
+            for path in _iter_grib2_files(args.control_dir):
+                n_control_files += 1
+                if n_control_files == 1 or n_control_files % _PROGRESS_EVERY == 0:
+                    print(f"  Control scan: inspected {n_control_files} files...")
                 fcst = _try_open_forecast_file(path, "Control")
                 if fcst is None:
                     n_control_skipped += 1
                     continue
                 if process_forecast(path, fcst, control_acc_by_lead, control_acc_by_lead_valid):
                     n_control_matches += 1
-                    break
-    else:
-        print("  Control directory layout not inferred from cycles; falling back to recursive scan.")
-        for path in _iter_grib2_files(args.control_dir):
-            n_control_files += 1
-            if n_control_files == 1 or n_control_files % _PROGRESS_EVERY == 0:
-                print(f"  Control scan: inspected {n_control_files} files...")
-            fcst = _try_open_forecast_file(path, "Control")
-            if fcst is None:
-                n_control_skipped += 1
-                continue
-            if process_forecast(path, fcst, control_acc_by_lead, control_acc_by_lead_valid):
-                n_control_matches += 1
-    if n_control_files == 0:
-        raise ValueError(
-            "Control directory must contain GRIB2 files "
-            f"({', '.join(sorted(_GRIB2_SUFFIXES))})."
-        )
+        if n_control_files == 0:
+            raise ValueError(
+                "Control directory must contain GRIB2 files "
+                f"({', '.join(sorted(_GRIB2_SUFFIXES))})."
+            )
     print(
-        "Control scan complete: "
+        "Control processing complete: "
         f"matched {n_control_matches} files after inspecting {n_control_files} files; "
         f"skipped {n_control_skipped} files."
     )
 
+    # ------------------------------------------------------------------ #
+    #  Experiment ACC computation                                          #
+    # ------------------------------------------------------------------ #
     print(f"Processing {len(experiment_forecasts)} experiment forecast files...")
     n_experiment_matches = 0
     for idx, (path, fcst) in enumerate(experiment_forecasts, start=1):
