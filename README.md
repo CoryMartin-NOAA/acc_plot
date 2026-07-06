@@ -42,6 +42,12 @@ python ./plot_acc_500hpa.py \
   --output-plot /path/to/acc_500hpa.png
 ```
 
+For GRIB2 forecast inputs, use `./plot_acc_500hpa_grib2.py`.  Climatology can be
+either GRIB2 (`hgt500_climo_MMDD*.grib2`) or NetCDF
+(`hgt500_climo_MMDD.grb.nc`/`hgt500_climo_MMDD.nc`).  If only GRIB1 climo files
+are present (e.g. `mean_MMDD`), generate NetCDF climo first with
+`./build_hgt500_climo.sh`.
+
 ### 3) Convert experiment GRIB2 files to NetCDF
 
 `./convert_grib2_to_netcdf.sh`
