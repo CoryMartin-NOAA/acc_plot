@@ -385,9 +385,21 @@ def _expected_paths(base_dir: Path, model: str, cycle_dt: datetime, lead_h: int)
     return [base_dir / sd / fn for sd in subdirs for fn in file_names]
 
 
+def _find_first_existing_path(
+    base_dir: Path, model: str, cycle_dt: datetime, lead_h: int
+) -> Path | None:
+    """Return the first candidate path that exists on disk, or None."""
+    for path in _expected_paths(base_dir, model, cycle_dt, lead_h):
+        if path.exists():
+            return path
+    return None
+
+
 def _try_open_forecast_file(path: Path, dataset_name: str) -> dict | None:
     try:
         return _open_grib2_file(path)
+    except OSError:
+        return None
     except KeyError as exc:
         print(f"  {dataset_name} skip: {exc}")
         return None
@@ -456,40 +468,66 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     #  Experiment file discovery                                           #
     # ------------------------------------------------------------------ #
+    # experiment_forecasts: used in directory-scan mode only [(path, fcst_data)]
+    # experiment_file_specs: used in date-range mode only [(cycle_dt, lead_h, path)]
     experiment_forecasts = []
+    experiment_file_specs = []
     experiment_valid_dates = set()
     experiment_cycles = set()
 
     if use_date_range:
+        # In date-range mode we only check existence of f000 and f_max per cycle
+        # to decide whether to include that cycle at all.  All intermediate leads
+        # are assumed to exist when both bookend files are present.  Actual GRIB2
+        # opens are deferred to the processing phase so we get fast discovery and
+        # clear per-cycle progress in the processing step.
+        cycles = list(_iter_cycles(start_dt, end_dt, args.cycle_interval))
+        n_cycles = len(cycles)
+        n_cycles_ok = 0
+        n_cycles_skipped = 0
         print(
             f"Building {args.experiment_model} experiment file list "
-            f"({start_dt.date()} to {end_dt.date()})..."
+            f"({start_dt.date()} to {end_dt.date()}, {n_cycles} cycles)..."
         )
-        n_exp_missing = 0
-        for cycle_dt in _iter_cycles(start_dt, end_dt, args.cycle_interval):
+        for cycle_idx, cycle_dt in enumerate(cycles, start=1):
+            pct = 100 * cycle_idx // n_cycles
+            label = f"[{cycle_idx:>{len(str(n_cycles))}}/{n_cycles} {pct:3d}%] {_format_dt(cycle_dt)}"
+            f000_path = _find_first_existing_path(
+                args.experiment_dir, args.experiment_model, cycle_dt, 0
+            )
+            fmax_path = _find_first_existing_path(
+                args.experiment_dir, args.experiment_model, cycle_dt, max_lead
+            )
+            if f000_path is None or fmax_path is None:
+                n_cycles_skipped += 1
+                missing = []
+                if f000_path is None:
+                    missing.append("f000")
+                if fmax_path is None:
+                    missing.append(f"f{max_lead:03d}")
+                print(f"  {label}: SKIP (missing {', '.join(missing)})")
+                continue
+            n_cycles_ok += 1
+            experiment_cycles.add(cycle_dt)
             for lead_h in range(0, max_lead + 1, args.forecast_interval):
-                found = False
-                for path in _expected_paths(
-                    args.experiment_dir, args.experiment_model, cycle_dt, lead_h
-                ):
-                    if path.exists():
-                        fcst = _try_open_forecast_file(path, "Experiment")
-                        if fcst is not None:
-                            experiment_forecasts.append((path, fcst))
-                            experiment_valid_dates.add(fcst["valid_dt"])
-                            experiment_cycles.add(fcst["ref_dt"])
-                            found = True
-                        break
-                if not found:
-                    n_exp_missing += 1
-        if not experiment_forecasts:
+                # Derive the path for this lead from the f000 template (same dir,
+                # replace the lead-hour suffix in the filename).
+                lead_name = re.sub(r'f\d{3}', f'f{lead_h:03d}', f000_path.name)
+                path = f000_path.parent / lead_name
+                experiment_file_specs.append((cycle_dt, lead_h, path))
+                experiment_valid_dates.add(cycle_dt + timedelta(hours=lead_h))
+            print(
+                f"  {label}: ok "
+                f"(f000={f000_path.name}, f{max_lead:03d}={fmax_path.name})"
+            )
+        if not experiment_file_specs:
             raise ValueError(
                 f"No {args.experiment_model} experiment files found for the specified date range "
                 f"in {args.experiment_dir}."
             )
         print(
-            f"Experiment discovery complete: {len(experiment_forecasts)} files found, "
-            f"{n_exp_missing} expected paths missing."
+            f"Experiment file list complete: {n_cycles_ok}/{n_cycles} cycles ok, "
+            f"{len(experiment_file_specs)} files queued, {n_cycles_skipped} cycles skipped."
         )
     else:
         print(f"Scanning experiment directory: {args.experiment_dir}")
@@ -538,12 +576,16 @@ def main() -> None:
 
     if use_date_range:
         analysis_model = args.analysis_model
+        sorted_valid_dates = sorted(experiment_valid_dates)
+        n_valid = len(sorted_valid_dates)
         print(
-            f"Locating {analysis_model} analysis (f000) files in: {args.analysis_dir} "
-            f"for {len(experiment_valid_dates)} experiment valid dates"
+            f"Locating {analysis_model} analysis (f000) files "
+            f"({n_valid} unique valid dates)..."
         )
         n_analysis_missing = 0
-        for valid_dt in sorted(experiment_valid_dates):
+        for vd_idx, valid_dt in enumerate(sorted_valid_dates, start=1):
+            pct = 100 * vd_idx // n_valid
+            label = f"[{vd_idx:>{len(str(n_valid))}}/{n_valid} {pct:3d}%] {_format_dt(valid_dt)}"
             found = False
             for path in _expected_paths(args.analysis_dir, analysis_model, valid_dt, 0):
                 if path.exists():
@@ -560,6 +602,9 @@ def main() -> None:
                     break
             if not found:
                 n_analysis_missing += 1
+                print(f"  {label}: missing")
+            elif vd_idx == 1 or vd_idx % _PROGRESS_EVERY == 0 or vd_idx == n_valid:
+                print(f"  {label}: ok  (matched {len(analysis_by_valid)}/{vd_idx} so far)")
         if not analysis_by_valid:
             raise ValueError(
                 f"No {analysis_model} f000 analysis files found for the specified date range "
@@ -568,8 +613,7 @@ def main() -> None:
         matched_analysis_dates = set(analysis_by_valid) & experiment_valid_dates
         print(
             f"Analysis discovery complete: matched {len(matched_analysis_dates)} of "
-            f"{len(experiment_valid_dates)} experiment valid dates; "
-            f"{n_analysis_missing} expected paths missing."
+            f"{n_valid} valid dates; {n_analysis_missing} missing."
         )
     else:
         n_analysis_f00 = 0
@@ -698,25 +742,53 @@ def main() -> None:
     n_control_skipped = 0
 
     if use_date_range:
+        # Same strategy as experiment: check only f000 and f_max per cycle,
+        # then process all leads for cycles where both bookends exist.
+        ctrl_cycles = list(_iter_cycles(start_dt, end_dt, args.cycle_interval))
+        n_ctrl_cycles = len(ctrl_cycles)
+        n_ctrl_cycles_ok = 0
+        n_ctrl_cycles_skipped = 0
         print(
             f"Processing {args.control_model} control files "
-            f"({start_dt.date()} to {end_dt.date()})..."
+            f"({start_dt.date()} to {end_dt.date()}, {n_ctrl_cycles} cycles)..."
         )
-        for cycle_dt in _iter_cycles(start_dt, end_dt, args.cycle_interval):
+        for cycle_idx, cycle_dt in enumerate(ctrl_cycles, start=1):
+            pct = 100 * cycle_idx // n_ctrl_cycles
+            label = f"[{cycle_idx:>{len(str(n_ctrl_cycles))}}/{n_ctrl_cycles} {pct:3d}%] {_format_dt(cycle_dt)}"
+            f000_path = _find_first_existing_path(
+                args.control_dir, args.control_model, cycle_dt, 0
+            )
+            fmax_path = _find_first_existing_path(
+                args.control_dir, args.control_model, cycle_dt, max_lead
+            )
+            if f000_path is None or fmax_path is None:
+                n_ctrl_cycles_skipped += 1
+                missing = []
+                if f000_path is None:
+                    missing.append("f000")
+                if fmax_path is None:
+                    missing.append(f"f{max_lead:03d}")
+                print(f"  {label}: SKIP (missing {', '.join(missing)})")
+                continue
+            n_ctrl_cycles_ok += 1
+            n_cycle_matches = 0
+            n_cycle_files = 0
             for lead_h in range(0, max_lead + 1, args.forecast_interval):
-                for path in _expected_paths(
-                    args.control_dir, args.control_model, cycle_dt, lead_h
+                lead_name = re.sub(r'f\d{3}', f'f{lead_h:03d}', f000_path.name)
+                path = f000_path.parent / lead_name
+                n_cycle_files += 1
+                fcst = _try_open_forecast_file(path, "Control")
+                if fcst is None:
+                    n_control_skipped += 1
+                elif process_forecast(
+                    path, fcst, control_acc_by_lead, control_acc_by_lead_valid
                 ):
-                    if path.exists():
-                        n_control_files += 1
-                        fcst = _try_open_forecast_file(path, "Control")
-                        if fcst is None:
-                            n_control_skipped += 1
-                        elif process_forecast(
-                            path, fcst, control_acc_by_lead, control_acc_by_lead_valid
-                        ):
-                            n_control_matches += 1
-                        break
+                    n_control_matches += 1
+                    n_cycle_matches += 1
+                n_control_files += 1
+            print(
+                f"  {label}: {n_cycle_matches}/{n_cycle_files} leads matched"
+            )
     else:
         print(f"Scanning control directory: {args.control_dir}")
         control_cycle_roots = _index_cycle_roots(args.control_dir)
@@ -769,13 +841,40 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     #  Experiment ACC computation                                          #
     # ------------------------------------------------------------------ #
-    print(f"Processing {len(experiment_forecasts)} experiment forecast files...")
-    n_experiment_matches = 0
-    for idx, (path, fcst) in enumerate(experiment_forecasts, start=1):
-        if idx == 1 or idx % _PROGRESS_EVERY == 0:
-            print(f"  Experiment processing: inspected {idx} files...")
-        if process_forecast(path, fcst, experiment_acc_by_lead, experiment_acc_by_lead_valid):
-            n_experiment_matches += 1
+    if use_date_range:
+        # Date-range mode: open files now (deferred from discovery) and compute ACC.
+        # Group specs by cycle for per-cycle progress logging.
+        from itertools import groupby as _groupby
+        specs_by_cycle = [
+            (cycle_dt, list(grp))
+            for cycle_dt, grp in _groupby(experiment_file_specs, key=lambda x: x[0])
+        ]
+        n_exp_cycles = len(specs_by_cycle)
+        n_experiment_matches = 0
+        print(
+            f"Processing {args.experiment_model} experiment files "
+            f"({len(experiment_file_specs)} files across {n_exp_cycles} cycles)..."
+        )
+        for cycle_idx, (cycle_dt, specs) in enumerate(specs_by_cycle, start=1):
+            pct = 100 * cycle_idx // n_exp_cycles
+            label = f"[{cycle_idx:>{len(str(n_exp_cycles))}}/{n_exp_cycles} {pct:3d}%] {_format_dt(cycle_dt)}"
+            n_cycle_matches = 0
+            for _cycle_dt, lead_h, path in specs:
+                fcst = _try_open_forecast_file(path, "Experiment")
+                if fcst is None:
+                    continue
+                if process_forecast(path, fcst, experiment_acc_by_lead, experiment_acc_by_lead_valid):
+                    n_cycle_matches += 1
+                    n_experiment_matches += 1
+            print(f"  {label}: {n_cycle_matches}/{len(specs)} leads matched")
+    else:
+        print(f"Processing {len(experiment_forecasts)} experiment forecast files...")
+        n_experiment_matches = 0
+        for idx, (path, fcst) in enumerate(experiment_forecasts, start=1):
+            if idx == 1 or idx % _PROGRESS_EVERY == 0:
+                print(f"  Experiment processing: inspected {idx} files...")
+            if process_forecast(path, fcst, experiment_acc_by_lead, experiment_acc_by_lead_valid):
+                n_experiment_matches += 1
     print(
         "Experiment processing complete: "
         f"matched {n_experiment_matches} files."
