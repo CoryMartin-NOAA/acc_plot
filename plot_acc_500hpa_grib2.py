@@ -243,6 +243,14 @@ def _mean_by_leads(acc_by_lead: dict, leads: list[int]) -> list[float]:
     return [float(np.nanmean(acc_by_lead[lead])) if lead in acc_by_lead else np.nan for lead in leads]
 
 
+def _try_open_forecast_file(path: Path, dataset_name: str) -> dict | None:
+    try:
+        return _open_grib2_file(path)
+    except KeyError as exc:
+        print(f"  {dataset_name} skip: {exc}")
+        return None
+
+
 def _paired_diff_ci95(
     control_by_valid: dict,
     experiment_by_valid: dict,
@@ -289,11 +297,15 @@ def main() -> None:
     experiment_forecasts = []
     experiment_valid_dates = set()
     n_experiment_files = 0
+    n_experiment_skipped = 0
     for path in _iter_grib2_files(args.experiment_dir):
         n_experiment_files += 1
         if n_experiment_files == 1 or n_experiment_files % _PROGRESS_EVERY == 0:
             print(f"  Experiment scan: inspected {n_experiment_files} files...")
-        fcst = _open_grib2_file(path)
+        fcst = _try_open_forecast_file(path, "Experiment")
+        if fcst is None:
+            n_experiment_skipped += 1
+            continue
         lead = int(round((fcst["valid_dt"] - fcst["ref_dt"]).total_seconds() / 3600.0))
         if lead < 0 or lead > args.max_lead:
             continue
@@ -311,11 +323,12 @@ def main() -> None:
     print(
         "Experiment scan complete: "
         f"{len(experiment_forecasts)} usable files covering "
-        f"{_describe_dates(experiment_valid_dates)}."
+        f"{_describe_dates(experiment_valid_dates)}; skipped {n_experiment_skipped} files."
     )
 
     analysis_by_valid = {}
     n_analysis_f00 = 0
+    n_analysis_skipped = 0
     print(
         f"Scanning analysis directory: {args.analysis_dir} "
         f"for {len(experiment_valid_dates)} experiment valid dates"
@@ -325,7 +338,10 @@ def main() -> None:
         n_analysis_files += 1
         if n_analysis_files == 1 or n_analysis_files % _PROGRESS_EVERY == 0:
             print(f"  Analysis scan: inspected {n_analysis_files} files...")
-        info = _open_grib2_file(path)
+        info = _try_open_forecast_file(path, "Analysis")
+        if info is None:
+            n_analysis_skipped += 1
+            continue
         # Enforce analysis inputs to be f00 only (lead == 0).
         lead = int(round((info["valid_dt"] - info["ref_dt"]).total_seconds() / 3600.0))
         if lead != 0:
@@ -352,7 +368,8 @@ def main() -> None:
     print(
         "Analysis scan complete: "
         f"matched {len(matched_analysis_dates)} of {len(experiment_valid_dates)} "
-        f"experiment valid dates after inspecting {n_analysis_files} files."
+        f"experiment valid dates after inspecting {n_analysis_files} files; "
+        f"skipped {n_analysis_skipped} files."
     )
 
     cached_climo = {}
@@ -394,11 +411,15 @@ def main() -> None:
     print(f"Scanning control directory: {args.control_dir}")
     n_control_files = 0
     n_control_matches = 0
+    n_control_skipped = 0
     for path in _iter_grib2_files(args.control_dir):
         n_control_files += 1
         if n_control_files == 1 or n_control_files % _PROGRESS_EVERY == 0:
             print(f"  Control scan: inspected {n_control_files} files...")
-        fcst = _open_grib2_file(path)
+        fcst = _try_open_forecast_file(path, "Control")
+        if fcst is None:
+            n_control_skipped += 1
+            continue
         if process_forecast(path, fcst, control_acc_by_lead, control_acc_by_lead_valid):
             n_control_matches += 1
     if n_control_files == 0:
@@ -408,7 +429,8 @@ def main() -> None:
         )
     print(
         "Control scan complete: "
-        f"matched {n_control_matches} files after inspecting {n_control_files} files."
+        f"matched {n_control_matches} files after inspecting {n_control_files} files; "
+        f"skipped {n_control_skipped} files."
     )
 
     print(f"Processing {len(experiment_forecasts)} experiment forecast files...")
