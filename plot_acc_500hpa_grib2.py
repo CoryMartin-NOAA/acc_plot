@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 
@@ -224,6 +224,60 @@ def _iter_grib2_files(directory: Path):
             yield path
 
 
+def _infer_lead_hours_from_name(path: Path) -> int | None:
+    name = path.name
+    match = re.search(r"\.f(\d{3})(?:\D|$)", name, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"pgbf(\d{2,3})(?:\D|$)", name, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _index_cycle_roots(directory: Path) -> dict[str, list[Path]]:
+    cycle_roots = defaultdict(list)
+    candidates = [directory]
+    try:
+        candidates.extend(path for path in directory.iterdir() if path.is_dir())
+    except FileNotFoundError:
+        return cycle_roots
+    if re.fullmatch(r"\d{2}", directory.name) and re.search(r"\.\d{8}$", directory.parent.name):
+        candidates.append(directory.parent)
+
+    for path in candidates:
+        match = re.search(r"\.(\d{8})$", path.name)
+        if match:
+            cycle_roots[match.group(1)].append(path)
+    return cycle_roots
+
+
+def _find_cycle_files(
+    cycle_roots: dict[str, list[Path]],
+    cycle_dt: datetime,
+    lead_hours: int,
+) -> list[Path]:
+    ymd = cycle_dt.strftime("%Y%m%d")
+    cyc = cycle_dt.strftime("%H")
+    matched = []
+    for root in cycle_roots.get(ymd, []):
+        cycle_dir = root / cyc
+        if not cycle_dir.is_dir():
+            continue
+        for path in sorted(cycle_dir.iterdir()):
+            if not path.is_file():
+                continue
+            file_name = path.name.lower()
+            if any(token in file_name for token in _SKIP_FILENAME_TOKENS):
+                continue
+            lead = _infer_lead_hours_from_name(path)
+            if lead is not None and lead != lead_hours:
+                continue
+            if path.suffix.lower() in _GRIB2_SUFFIXES or _looks_like_grib(path):
+                matched.append(path)
+    return matched
+
+
 def _format_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %HZ")
 
@@ -304,6 +358,7 @@ def main() -> None:
     print(f"Scanning experiment directory: {args.experiment_dir}")
     experiment_forecasts = []
     experiment_valid_dates = set()
+    experiment_cycles = set()
     n_experiment_files = 0
     n_experiment_skipped = 0
     for path in _iter_grib2_files(args.experiment_dir):
@@ -319,6 +374,7 @@ def main() -> None:
             continue
         experiment_forecasts.append((path, fcst))
         experiment_valid_dates.add(fcst["valid_dt"])
+        experiment_cycles.add(fcst["ref_dt"])
     if n_experiment_files == 0:
         raise ValueError(
             "Experiment directory must contain GRIB2 files "
@@ -333,39 +389,74 @@ def main() -> None:
         f"{len(experiment_forecasts)} usable files covering "
         f"{_describe_dates(experiment_valid_dates)}; skipped {n_experiment_skipped} files."
     )
+    experiment_cycles_sorted = sorted(experiment_cycles)
+    print(
+        "Experiment cycles: "
+        f"{_format_dt(experiment_cycles_sorted[0])} to "
+        f"{_format_dt(experiment_cycles_sorted[-1])} "
+        f"(n={len(experiment_cycles_sorted)})"
+    )
 
     analysis_by_valid = {}
     n_analysis_f00 = 0
     n_analysis_skipped = 0
+    analysis_cycle_roots = _index_cycle_roots(args.analysis_dir)
+    analysis_targets = sorted(experiment_valid_dates)
     print(
-        f"Scanning analysis directory: {args.analysis_dir} "
-        f"for {len(experiment_valid_dates)} experiment valid dates"
+        f"Locating analysis files in: {args.analysis_dir} "
+        f"for {len(analysis_targets)} experiment valid dates"
     )
     n_analysis_files = 0
-    for path in _iter_grib2_files(args.analysis_dir):
-        n_analysis_files += 1
-        if n_analysis_files == 1 or n_analysis_files % _PROGRESS_EVERY == 0:
-            print(f"  Analysis scan: inspected {n_analysis_files} files...")
-        info = _try_open_forecast_file(path, "Analysis")
-        if info is None:
-            n_analysis_skipped += 1
-            continue
-        # Enforce analysis inputs to be f00 only (lead == 0).
-        lead = int(round((info["valid_dt"] - info["ref_dt"]).total_seconds() / 3600.0))
-        if lead != 0:
-            continue
-        analysis_by_valid[info["valid_dt"]] = info
-        n_analysis_f00 += 1
-        if info["valid_dt"] in experiment_valid_dates:
-            print(
-                "  Matched analysis valid time "
-                f"{_format_dt(info['valid_dt'])} "
-                f"({len(set(analysis_by_valid) & experiment_valid_dates)}/"
-                f"{len(experiment_valid_dates)})"
-            )
-            if experiment_valid_dates.issubset(analysis_by_valid):
-                print("  Found all experiment dates in analysis directory; stopping early.")
+    if analysis_cycle_roots:
+        for target_dt in analysis_targets:
+            paths = _find_cycle_files(analysis_cycle_roots, target_dt, lead_hours=0)
+            n_analysis_files += len(paths)
+            if n_analysis_files == 1 or n_analysis_files % _PROGRESS_EVERY == 0:
+                print(f"  Analysis lookup: inspected {n_analysis_files} candidate files...")
+            for path in paths:
+                info = _try_open_forecast_file(path, "Analysis")
+                if info is None:
+                    n_analysis_skipped += 1
+                    continue
+                # Enforce analysis inputs to be f00 only (lead == 0).
+                lead = int(round((info["valid_dt"] - info["ref_dt"]).total_seconds() / 3600.0))
+                if lead != 0 or info["valid_dt"] != target_dt:
+                    continue
+                analysis_by_valid[info["valid_dt"]] = info
+                n_analysis_f00 += 1
+                print(
+                    "  Matched analysis valid time "
+                    f"{_format_dt(info['valid_dt'])} "
+                    f"({len(set(analysis_by_valid) & experiment_valid_dates)}/"
+                    f"{len(experiment_valid_dates)})"
+                )
                 break
+    else:
+        print("  Analysis directory layout not inferred from cycles; falling back to recursive scan.")
+        for path in _iter_grib2_files(args.analysis_dir):
+            n_analysis_files += 1
+            if n_analysis_files == 1 or n_analysis_files % _PROGRESS_EVERY == 0:
+                print(f"  Analysis scan: inspected {n_analysis_files} files...")
+            info = _try_open_forecast_file(path, "Analysis")
+            if info is None:
+                n_analysis_skipped += 1
+                continue
+            # Enforce analysis inputs to be f00 only (lead == 0).
+            lead = int(round((info["valid_dt"] - info["ref_dt"]).total_seconds() / 3600.0))
+            if lead != 0:
+                continue
+            analysis_by_valid[info["valid_dt"]] = info
+            n_analysis_f00 += 1
+            if info["valid_dt"] in experiment_valid_dates:
+                print(
+                    "  Matched analysis valid time "
+                    f"{_format_dt(info['valid_dt'])} "
+                    f"({len(set(analysis_by_valid) & experiment_valid_dates)}/"
+                    f"{len(experiment_valid_dates)})"
+                )
+                if experiment_valid_dates.issubset(analysis_by_valid):
+                    print("  Found all experiment dates in analysis directory; stopping early.")
+                    break
 
     if n_analysis_f00 == 0:
         raise ValueError(
@@ -417,19 +508,45 @@ def main() -> None:
         return True
 
     print(f"Scanning control directory: {args.control_dir}")
+    control_cycle_roots = _index_cycle_roots(args.control_dir)
+    control_targets = sorted(
+        {
+            (
+                fcst["ref_dt"],
+                int(round((fcst["valid_dt"] - fcst["ref_dt"]).total_seconds() / 3600.0)),
+            )
+            for _, fcst in experiment_forecasts
+        }
+    )
     n_control_files = 0
     n_control_matches = 0
     n_control_skipped = 0
-    for path in _iter_grib2_files(args.control_dir):
-        n_control_files += 1
-        if n_control_files == 1 or n_control_files % _PROGRESS_EVERY == 0:
-            print(f"  Control scan: inspected {n_control_files} files...")
-        fcst = _try_open_forecast_file(path, "Control")
-        if fcst is None:
-            n_control_skipped += 1
-            continue
-        if process_forecast(path, fcst, control_acc_by_lead, control_acc_by_lead_valid):
-            n_control_matches += 1
+    if control_cycle_roots:
+        for ref_dt, lead_hours in control_targets:
+            paths = _find_cycle_files(control_cycle_roots, ref_dt, lead_hours=lead_hours)
+            n_control_files += len(paths)
+            if n_control_files == 1 or n_control_files % _PROGRESS_EVERY == 0:
+                print(f"  Control lookup: inspected {n_control_files} candidate files...")
+            for path in paths:
+                fcst = _try_open_forecast_file(path, "Control")
+                if fcst is None:
+                    n_control_skipped += 1
+                    continue
+                if process_forecast(path, fcst, control_acc_by_lead, control_acc_by_lead_valid):
+                    n_control_matches += 1
+                    break
+    else:
+        print("  Control directory layout not inferred from cycles; falling back to recursive scan.")
+        for path in _iter_grib2_files(args.control_dir):
+            n_control_files += 1
+            if n_control_files == 1 or n_control_files % _PROGRESS_EVERY == 0:
+                print(f"  Control scan: inspected {n_control_files} files...")
+            fcst = _try_open_forecast_file(path, "Control")
+            if fcst is None:
+                n_control_skipped += 1
+                continue
+            if process_forecast(path, fcst, control_acc_by_lead, control_acc_by_lead_valid):
+                n_control_matches += 1
     if n_control_files == 0:
         raise ValueError(
             "Control directory must contain GRIB2 files "
