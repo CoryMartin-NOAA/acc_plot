@@ -380,6 +380,7 @@ def _expected_paths(base_dir: Path, model: str, cycle_dt: datetime, lead_h: int)
         f"{stem}.pgrb2.0p50.f{fstr}",
         f"{stem}.pgrb2.1p00.f{fstr}",
         f"{stem}.pgrbf{fstr}",
+        f"{stem}.pres.f{fstr}.grib2",
     ]
     return [base_dir / sd / fn for sd in subdirs for fn in file_names]
 
