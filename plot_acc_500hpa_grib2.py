@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 
 g2 = None  # grib2io module reference, populated lazily by _ensure_dependencies()
+nc = None
 np = None
 # Standard meteorological convention for "useful" ACC forecast skill.
 SKILL_THRESHOLD = 0.6
@@ -87,6 +88,29 @@ def _ensure_dependencies() -> None:
         except ImportError as exc:
             raise ImportError("numpy is required for ACC calculations.") from exc
         np = _np
+
+
+def _ensure_netcdf_dependency() -> None:
+    global nc
+    if nc is None:
+        try:
+            import netCDF4 as _nc
+        except ImportError as exc:
+            raise ImportError(
+                "netCDF4 is required to read NetCDF climatology fallback files."
+            ) from exc
+        nc = _nc
+
+
+def _grib_edition(path: Path) -> int | None:
+    try:
+        with path.open("rb") as fh:
+            header = fh.read(8)
+    except OSError:
+        return None
+    if len(header) < 8 or header[:4] != _GRIB_MAGIC:
+        return None
+    return int(header[7])
 
 
 def _select_hgt500(f) -> object:
@@ -195,6 +219,73 @@ def _regrid(data: "np.ndarray", src_lat: "np.ndarray", src_lon: "np.ndarray",
     return interp((tgt_lat_2d, tgt_lon_2d))
 
 
+def _find_hgt_name(ds) -> str:
+    if "var7" in ds.variables:
+        return "var7"
+    if "HGT_500mb" in ds.variables:
+        return "HGT_500mb"
+    for name in ds.variables:
+        if re.search(r"^HGT.*(?:_500mb|_500MB|500hPa)", name):
+            return name
+    raise KeyError("Could not find a 500 hPa geopotential height variable.")
+
+
+def _load_climo_from_netcdf(
+    path: Path,
+    valid_hour: int,
+    tgt_lat: "np.ndarray",
+    tgt_lon: "np.ndarray",
+) -> dict:
+    _ensure_dependencies()
+    _ensure_netcdf_dependency()
+    with nc.Dataset(path) as ds:
+        lat_name = "latitude" if "latitude" in ds.variables else "lat"
+        lon_name = "longitude" if "longitude" in ds.variables else "lon"
+        hgt_name = _find_hgt_name(ds)
+        hgt_var = ds.variables[hgt_name]
+
+        time_idx = 0
+        if "time" in ds.variables:
+            try:
+                tvals = ds.variables["time"][:]
+                tunits = getattr(ds.variables["time"], "units", None)
+                if tunits and len(tvals) > 1:
+                    tdates = nc.num2date(tvals, units=tunits)
+                    time_idx = min(
+                        range(len(tdates)),
+                        key=lambda i: abs(int(tdates[i].hour) - valid_hour),
+                    )
+            except Exception:
+                time_idx = 0
+
+        if hgt_var.ndim == 4:
+            hgt = np.array(hgt_var[time_idx, 0, :, :], dtype=np.float64)
+        elif hgt_var.ndim == 3:
+            if hgt_var.dimensions and hgt_var.dimensions[0] == "time":
+                hgt = np.array(hgt_var[time_idx, :, :], dtype=np.float64)
+            else:
+                hgt = np.array(hgt_var[0, :, :], dtype=np.float64)
+        elif hgt_var.ndim == 2:
+            hgt = np.array(hgt_var[:, :], dtype=np.float64)
+        else:
+            raise ValueError(f"Unexpected rank {hgt_var.ndim} for HGT variable in {path}")
+
+        fill_value = getattr(hgt_var, "_FillValue", None)
+        if fill_value is not None:
+            hgt = np.where(np.isclose(hgt, float(fill_value)), np.nan, hgt)
+
+        src_lat = np.array(ds.variables[lat_name][:], dtype=np.float64)
+        src_lon = np.array(ds.variables[lon_name][:], dtype=np.float64)
+
+    if src_lat.shape != tgt_lat.shape or src_lon.shape != tgt_lon.shape or not (
+        np.allclose(src_lat, tgt_lat, atol=1e-6, rtol=1e-9)
+        and np.allclose(src_lon, tgt_lon, atol=1e-6, rtol=1e-9)
+    ):
+        hgt = _regrid(hgt, src_lat, src_lon, tgt_lat, tgt_lon)
+
+    return {"hgt": hgt, "lat": tgt_lat, "lon": tgt_lon}
+
+
 def _load_climo(climo_dir: Path, mmdd: str, valid_hour: int,
                tgt_lat: "np.ndarray", tgt_lon: "np.ndarray") -> dict:
     _ensure_dependencies()
@@ -207,10 +298,29 @@ def _load_climo(climo_dir: Path, mmdd: str, valid_hour: int,
         for stem in (f"hgt500_climo_{mmdd}", f"mean_{mmdd}")
         for suffix in (".grb2", ".grib2", ".grb", ".grib")
     ]
+    netcdf_candidates = [
+        climo_dir / f"hgt500_climo_{mmdd}.grb.nc",
+        climo_dir / f"hgt500_climo_{mmdd}.nc",
+        climo_dir / f"mean_{mmdd}.nc",
+    ]
     path = next((c for c in candidates if c.exists()), None)
     if path is None:
+        nc_path = next((c for c in netcdf_candidates if c.exists()), None)
+        if nc_path is not None:
+            return _load_climo_from_netcdf(nc_path, valid_hour, tgt_lat, tgt_lon)
         raise FileNotFoundError(
-            f"Climatology GRIB2 file not found for MMDD={mmdd} in {climo_dir}"
+            f"Climatology file not found for MMDD={mmdd} in {climo_dir}. "
+            "Expected GRIB2 or NetCDF climatology files."
+        )
+
+    if _grib_edition(path) == 1:
+        nc_path = next((c for c in netcdf_candidates if c.exists()), None)
+        if nc_path is not None:
+            return _load_climo_from_netcdf(nc_path, valid_hour, tgt_lat, tgt_lon)
+        raise ValueError(
+            f"Climatology file {path} is GRIB1, but this script reads climatology via "
+            "GRIB2 or NetCDF fallback. Generate/point to NetCDF climatology (for example "
+            f"{climo_dir / f'hgt500_climo_{mmdd}.grb.nc'})."
         )
 
     with g2.open(path) as f:
