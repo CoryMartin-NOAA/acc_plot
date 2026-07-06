@@ -200,6 +200,9 @@ def _load_climo(climo_dir: Path, mmdd: str, valid_hour: int,
     _ensure_dependencies()
     # Search for a GRIB2 climo file using common naming conventions and extensions.
     candidates = [
+        climo_dir / stem
+        for stem in (f"hgt500_climo_{mmdd}", f"mean_{mmdd}")
+    ] + [
         climo_dir / f"{stem}{suffix}"
         for stem in (f"hgt500_climo_{mmdd}", f"mean_{mmdd}")
         for suffix in (".grb2", ".grib2", ".grb", ".grib")
