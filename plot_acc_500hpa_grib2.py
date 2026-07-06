@@ -15,6 +15,7 @@ SKILL_THRESHOLD = 0.6
 # Common GRIB2 file suffixes recognised when scanning input directories.
 _GRIB2_SUFFIXES = frozenset({".grb2", ".grib2", ".grb", ".grib"})
 _GRIB_MAGIC = b"GRIB"
+_PROGRESS_EVERY = 25
 
 
 def parse_args() -> argparse.Namespace:
@@ -210,12 +211,25 @@ def _looks_like_grib(path: Path) -> bool:
         return False
 
 
-def _list_grib2_files(directory: Path) -> list[Path]:
-    return sorted(
-        p for p in directory.rglob("*")
-        if p.is_file() and (
-            p.suffix.lower() in _GRIB2_SUFFIXES or _looks_like_grib(p)
-        )
+def _iter_grib2_files(directory: Path):
+    for path in directory.rglob("*"):
+        if path.is_file() and (
+            path.suffix.lower() in _GRIB2_SUFFIXES or _looks_like_grib(path)
+        ):
+            yield path
+
+
+def _format_dt(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %HZ")
+
+
+def _describe_dates(valid_dates: set[datetime]) -> str:
+    if not valid_dates:
+        return "none"
+    used_dates_sorted = sorted(valid_dates)
+    return (
+        f"{_format_dt(used_dates_sorted[0])} to "
+        f"{_format_dt(used_dates_sorted[-1])} (n={len(used_dates_sorted)})"
     )
 
 
@@ -271,18 +285,46 @@ def main() -> None:
     except ImportError as exc:
         raise ImportError("matplotlib is required to generate the ACC plot.") from exc
 
-    analysis_files = _list_grib2_files(args.analysis_dir)
-    control_files = _list_grib2_files(args.control_dir)
-    experiment_files = _list_grib2_files(args.experiment_dir)
-    if not analysis_files or not control_files or not experiment_files:
+    print(f"Scanning experiment directory: {args.experiment_dir}")
+    experiment_forecasts = []
+    experiment_valid_dates = set()
+    n_experiment_files = 0
+    for path in _iter_grib2_files(args.experiment_dir):
+        n_experiment_files += 1
+        if n_experiment_files == 1 or n_experiment_files % _PROGRESS_EVERY == 0:
+            print(f"  Experiment scan: inspected {n_experiment_files} files...")
+        fcst = _open_grib2_file(path)
+        lead = int(round((fcst["valid_dt"] - fcst["ref_dt"]).total_seconds() / 3600.0))
+        if lead < 0 or lead > args.max_lead:
+            continue
+        experiment_forecasts.append((path, fcst))
+        experiment_valid_dates.add(fcst["valid_dt"])
+    if n_experiment_files == 0:
         raise ValueError(
-            "Analysis, control, and experiment directories must each contain GRIB2 files "
+            "Experiment directory must contain GRIB2 files "
             f"({', '.join(sorted(_GRIB2_SUFFIXES))})."
         )
+    if not experiment_forecasts:
+        raise ValueError(
+            f"No experiment forecast files within 0-{args.max_lead}h lead were found."
+        )
+    print(
+        "Experiment scan complete: "
+        f"{len(experiment_forecasts)} usable files covering "
+        f"{_describe_dates(experiment_valid_dates)}."
+    )
 
     analysis_by_valid = {}
     n_analysis_f00 = 0
-    for path in analysis_files:
+    print(
+        f"Scanning analysis directory: {args.analysis_dir} "
+        f"for {len(experiment_valid_dates)} experiment valid dates"
+    )
+    n_analysis_files = 0
+    for path in _iter_grib2_files(args.analysis_dir):
+        n_analysis_files += 1
+        if n_analysis_files == 1 or n_analysis_files % _PROGRESS_EVERY == 0:
+            print(f"  Analysis scan: inspected {n_analysis_files} files...")
         info = _open_grib2_file(path)
         # Enforce analysis inputs to be f00 only (lead == 0).
         lead = int(round((info["valid_dt"] - info["ref_dt"]).total_seconds() / 3600.0))
@@ -290,12 +332,28 @@ def main() -> None:
             continue
         analysis_by_valid[info["valid_dt"]] = info
         n_analysis_f00 += 1
+        if info["valid_dt"] in experiment_valid_dates:
+            print(
+                "  Matched analysis valid time "
+                f"{_format_dt(info['valid_dt'])} "
+                f"({len(set(analysis_by_valid) & experiment_valid_dates)}/"
+                f"{len(experiment_valid_dates)})"
+            )
+            if experiment_valid_dates.issubset(analysis_by_valid):
+                print("  Found all experiment dates in analysis directory; stopping early.")
+                break
 
     if n_analysis_f00 == 0:
         raise ValueError(
             "No f00 analysis files found in analysis-dir. "
             "Provide analysis files with lead 0 only."
         )
+    matched_analysis_dates = set(analysis_by_valid) & experiment_valid_dates
+    print(
+        "Analysis scan complete: "
+        f"matched {len(matched_analysis_dates)} of {len(experiment_valid_dates)} "
+        f"experiment valid dates after inspecting {n_analysis_files} files."
+    )
 
     cached_climo = {}
     control_acc_by_lead = defaultdict(list)
@@ -304,14 +362,13 @@ def main() -> None:
     experiment_acc_by_lead_valid = defaultdict(dict)
     used_valid_dates = set()
 
-    def process_forecast(path: Path, target: defaultdict, target_by_valid: defaultdict) -> None:
-        fcst = _open_grib2_file(path)
+    def process_forecast(path: Path, fcst: dict, target: defaultdict, target_by_valid: defaultdict) -> bool:
         lead = int(round((fcst["valid_dt"] - fcst["ref_dt"]).total_seconds() / 3600.0))
         if lead < 0 or lead > args.max_lead:
-            return
+            return False
 
         if fcst["valid_dt"] not in analysis_by_valid:
-            return
+            return False
 
         analysis = analysis_by_valid[fcst["valid_dt"]]
         if not _same_grid(fcst, analysis):
@@ -332,11 +389,39 @@ def main() -> None:
         target[lead].append(acc_value)
         target_by_valid[lead][fcst["valid_dt"]] = acc_value
         used_valid_dates.add(fcst["valid_dt"])
+        return True
 
-    for path in control_files:
-        process_forecast(path, control_acc_by_lead, control_acc_by_lead_valid)
-    for path in experiment_files:
-        process_forecast(path, experiment_acc_by_lead, experiment_acc_by_lead_valid)
+    print(f"Scanning control directory: {args.control_dir}")
+    n_control_files = 0
+    n_control_matches = 0
+    for path in _iter_grib2_files(args.control_dir):
+        n_control_files += 1
+        if n_control_files == 1 or n_control_files % _PROGRESS_EVERY == 0:
+            print(f"  Control scan: inspected {n_control_files} files...")
+        fcst = _open_grib2_file(path)
+        if process_forecast(path, fcst, control_acc_by_lead, control_acc_by_lead_valid):
+            n_control_matches += 1
+    if n_control_files == 0:
+        raise ValueError(
+            "Control directory must contain GRIB2 files "
+            f"({', '.join(sorted(_GRIB2_SUFFIXES))})."
+        )
+    print(
+        "Control scan complete: "
+        f"matched {n_control_matches} files after inspecting {n_control_files} files."
+    )
+
+    print(f"Processing {len(experiment_forecasts)} experiment forecast files...")
+    n_experiment_matches = 0
+    for idx, (path, fcst) in enumerate(experiment_forecasts, start=1):
+        if idx == 1 or idx % _PROGRESS_EVERY == 0:
+            print(f"  Experiment processing: inspected {idx} files...")
+        if process_forecast(path, fcst, experiment_acc_by_lead, experiment_acc_by_lead_valid):
+            n_experiment_matches += 1
+    print(
+        "Experiment processing complete: "
+        f"matched {n_experiment_matches} files."
+    )
 
     leads = sorted(set(control_acc_by_lead.keys()) | set(experiment_acc_by_lead.keys()))
     if not leads:
@@ -359,8 +444,8 @@ def main() -> None:
 
     used_dates_sorted = sorted(used_valid_dates)
     if used_dates_sorted:
-        start_dt = used_dates_sorted[0].strftime("%Y-%m-%d %HZ")
-        end_dt = used_dates_sorted[-1].strftime("%Y-%m-%d %HZ")
+        start_dt = _format_dt(used_dates_sorted[0])
+        end_dt = _format_dt(used_dates_sorted[-1])
         dates_text = f"Dates used: {start_dt} to {end_dt} (n={len(used_dates_sorted)})"
     else:
         dates_text = "Dates used: none"
@@ -426,8 +511,8 @@ def main() -> None:
         experiment_ts = [experiment_ts_map[dt] for dt in common_valid_dates]
         diff_ts = [exp - ctrl for ctrl, exp in zip(control_ts, experiment_ts)]
 
-        ts_start = common_valid_dates[0].strftime("%Y-%m-%d %HZ")
-        ts_end = common_valid_dates[-1].strftime("%Y-%m-%d %HZ")
+        ts_start = _format_dt(common_valid_dates[0])
+        ts_end = _format_dt(common_valid_dates[-1])
         ts_dates_text = f"Dates used: {ts_start} to {ts_end} (n={len(common_valid_dates)})"
 
         fig_ts, (ax_ts_abs, ax_ts_diff) = plt.subplots(
