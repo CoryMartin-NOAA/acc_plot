@@ -16,6 +16,8 @@ SKILL_THRESHOLD = 0.6
 _GRIB2_SUFFIXES = frozenset({".grb2", ".grib2", ".grb", ".grib"})
 _GRIB_MAGIC = b"GRIB"
 _PROGRESS_EVERY = 25
+_SKIP_FILENAME_TOKENS = ("sfc", "flx")
+_MAX_ACC_LEAD_HOURS = 240
 
 
 def parse_args() -> argparse.Namespace:
@@ -213,6 +215,9 @@ def _looks_like_grib(path: Path) -> bool:
 
 def _iter_grib2_files(directory: Path):
     for path in directory.rglob("*"):
+        file_name = path.name.lower()
+        if any(token in file_name for token in _SKIP_FILENAME_TOKENS):
+            continue
         if path.is_file() and (
             path.suffix.lower() in _GRIB2_SUFFIXES or _looks_like_grib(path)
         ):
@@ -286,12 +291,15 @@ def _paired_diff_ci95(
 
 def main() -> None:
     args = parse_args()
+    max_lead = min(args.max_lead, _MAX_ACC_LEAD_HOURS)
 
     _ensure_dependencies()
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
         raise ImportError("matplotlib is required to generate the ACC plot.") from exc
+    if args.max_lead > _MAX_ACC_LEAD_HOURS:
+        print(f"--max-lead {args.max_lead} exceeds {_MAX_ACC_LEAD_HOURS}; using {_MAX_ACC_LEAD_HOURS}.")
 
     print(f"Scanning experiment directory: {args.experiment_dir}")
     experiment_forecasts = []
@@ -307,7 +315,7 @@ def main() -> None:
             n_experiment_skipped += 1
             continue
         lead = int(round((fcst["valid_dt"] - fcst["ref_dt"]).total_seconds() / 3600.0))
-        if lead < 0 or lead > args.max_lead:
+        if lead < 0 or lead > max_lead:
             continue
         experiment_forecasts.append((path, fcst))
         experiment_valid_dates.add(fcst["valid_dt"])
@@ -318,7 +326,7 @@ def main() -> None:
         )
     if not experiment_forecasts:
         raise ValueError(
-            f"No experiment forecast files within 0-{args.max_lead}h lead were found."
+            f"No experiment forecast files within 0-{max_lead}h lead were found."
         )
     print(
         "Experiment scan complete: "
@@ -381,7 +389,7 @@ def main() -> None:
 
     def process_forecast(path: Path, fcst: dict, target: defaultdict, target_by_valid: defaultdict) -> bool:
         lead = int(round((fcst["valid_dt"] - fcst["ref_dt"]).total_seconds() / 3600.0))
-        if lead < 0 or lead > args.max_lead:
+        if lead < 0 or lead > max_lead:
             return False
 
         if fcst["valid_dt"] not in analysis_by_valid:
@@ -485,9 +493,9 @@ def main() -> None:
         linewidth=1.0,
         label=f"Skill Threshold ({SKILL_THRESHOLD:.1f})",
     )
-    x_ticks = [0, 24, 48, 72, 96, 120, 144, 168, 192]
+    x_ticks = sorted(set([0, max_lead] + list(range(24, max_lead + 1, 24))))
     ax_abs.set_ylim(0.6, 1.0)
-    ax_abs.set_xlim(0, 192)
+    ax_abs.set_xlim(0, max_lead)
     ax_abs.set_xticks(x_ticks)
     ax_abs.set_ylabel("ACC")
     ax_abs.set_title(f"500 hPa Geopotential Height ACC\n{dates_text}")
